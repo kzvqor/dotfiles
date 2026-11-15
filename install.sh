@@ -1,1963 +1,1227 @@
-#!/bin/bash
-# install.sh - Arch + Hyprland: минимальная установка, сине-голубая тема
-# Запуск: su -   затем   bash install.sh [ИМЯ_ПОЛЬЗОВАТЕЛЯ]
-set -euo pipefail
-[ "$(id -u)" -eq 0 ] || { echo "Запусти от root: su -"; exit 1; }
-[ -f /etc/arch-release ] || { echo "Нужен Arch Linux"; exit 1; }
-U="${1:-$(getent passwd 1000 | cut -d: -f1 || true)}"
-[ -n "$U" ] || { echo "Не нашёл пользователя. Запусти: bash install.sh ИМЯ"; exit 1; }
-id "$U" >/dev/null 2>&1 || { echo "Пользователь $U не существует"; exit 1; }
-H="/home/$U"
-G="$(id -gn "$U")"
+#!/usr/bin/env bash
+# Минимальная установка Arch Linux + Hyprland для Intel UHD Graphics.
+# Запуск: sudo bash install.sh [имя_пользователя]
+set -Eeuo pipefail
+IFS=$'\n\t'
 
-# ================= пакеты =================
-# multilib нужен только для Steam (32-бит библиотеки)
-if ! grep -q '^\[multilib\]' /etc/pacman.conf; then
-  sed -i '/^#\[multilib\]/,/^#Include/ s/^#//' /etc/pacman.conf
-  grep -q '^\[multilib\]' /etc/pacman.conf \
-    || printf '\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n' >> /etc/pacman.conf
+readonly GREEN='\033[0;32m' YELLOW='\033[0;33m' RED='\033[0;31m' RESET='\033[0m'
+log()  { printf "${GREEN}==>${RESET} %s\n" "$*"; }
+warn() { printf "${YELLOW}!!${RESET} %s\n" "$*" >&2; }
+die()  { printf "${RED}ОШИБКА:${RESET} %s\n" "$*" >&2; exit 1; }
+trap 'rc=$?; printf "\n${RED}Сбой на строке %s (код %s).${RESET}\n" "$LINENO" "$rc" >&2; exit "$rc"' ERR
+
+[[ $EUID -eq 0 ]] || die "Запусти от root: sudo bash install.sh [пользователь]."
+[[ -f /etc/arch-release ]] || die "Этот установщик предназначен только для Arch Linux."
+command -v pacman >/dev/null || die "Не найден pacman."
+command -v runuser >/dev/null || die "Не найден runuser."
+
+TARGET_USER="${1:-${SUDO_USER:-}}"
+if [[ -z "$TARGET_USER" || "$TARGET_USER" == root ]]; then
+  TARGET_USER="$(getent passwd | awk -F: '$3 >= 1000 && $3 < 60000 && $6 ~ /^\/home\// {print $1; exit}')"
 fi
-# Arch - rolling: без полного обновления ставить пакеты нельзя
-pacman -Syu --noconfirm --needed sudo
-nv="$(pacman -Qq 2>/dev/null | grep -E '^(nvidia|lib32-nvidia|opencl-nvidia|lib32-opencl-nvidia)' || true)"
-[ -z "$nv" ] || pacman -Rns --noconfirm $nv || true
-pacman -S --noconfirm --needed \
-  hyprland hyprland-guiutils xdg-desktop-portal-hyprland xorg-xwayland qt6-wayland \
-  alacritty waybar wofi swaybg \
-  pipewire pipewire-pulse wireplumber \
-  brightnessctl grim slurp wl-clipboard \
-  ttf-dejavu ttf-font-awesome noto-fonts-emoji papirus-icon-theme adwaita-icon-theme lxqt-policykit ttf-jetbrains-mono-nerd ttf-nerd-fonts-symbols \
-  python-gobject gtk3 mesa vulkan-intel udisks2 xdg-utils xdg-user-dirs \
-  fastfetch chafa cava nano curl \
-  firefox firefox-i18n-ru telegram-desktop \
-  jre21-openjdk prismlauncher
-echo "=== Steam ==="
-pacman -S --noconfirm --needed steam lib32-mesa lib32-vulkan-intel \
-  || echo "!! Steam не установился (скрипт продолжает работу)"
+[[ -n "$TARGET_USER" && "$TARGET_USER" != root ]] || die "Не удалось определить обычного пользователя. Укажи его: sudo bash install.sh ИМЯ."
+id "$TARGET_USER" >/dev/null 2>&1 || die "Пользователь '$TARGET_USER' не существует."
+TARGET_UID="$(id -u "$TARGET_USER")"
+[[ "$TARGET_UID" -ge 1000 && "$TARGET_UID" -lt 60000 ]] || die "Укажи обычного пользователя с UID от 1000 до 59999."
+TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
+TARGET_GROUP="$(id -gn "$TARGET_USER")"
+[[ -d "$TARGET_HOME" && "$TARGET_HOME" != / ]] || die "Домашняя директория '$TARGET_HOME' не существует."
 
-# ================= sudo =================
-usermod -aG wheel,video "$U"
-printf '%%wheel ALL=(ALL:ALL) ALL\n' > /etc/sudoers.d/10-wheel
-chmod 440 /etc/sudoers.d/10-wheel
-visudo -cf /etc/sudoers.d/10-wheel >/dev/null || rm -f /etc/sudoers.d/10-wheel
+readonly APP_ROOT="/opt/hypr-minimal"
+readonly LIB_ROOT="/usr/local/lib/hypr-minimal"
+readonly BIN_ROOT="/usr/local/bin"
+readonly CONFIG_ROOT="$TARGET_HOME/.config"
+readonly STATE_ROOT="$TARGET_HOME/.local/state/hypr-minimal"
+readonly BACKUP_ROOT="$TARGET_HOME/.local/share/hypr-minimal-backups/$(date +%Y%m%d-%H%M%S)"
 
-# ================= системные утилиты =================
-cat > /usr/local/bin/pkg-install <<'EOF2'
-#!/bin/sh
-f="$(readlink -f "$1")"
-[ -f "$f" ] || { echo "Файл не найден: $1"; exit 1; }
-exec alacritty --title "Установка пакета Arch" -e sh -c '
-echo "Устанавливаю: $1"; echo
-sudo pacman -U --noconfirm "$1"
-echo; printf "Готово. Нажми Enter, чтобы закрыть..."; read _
-' sh "$f"
-EOF2
-chmod 755 /usr/local/bin/pkg-install
+backup_file() {
+  local f="$1"
+  if [[ -e "$f" || -L "$f" ]]; then
+    mkdir -p "$BACKUP_ROOT$(dirname "$f")"
+    cp -a -- "$f" "$BACKUP_ROOT$f"
+    log "Резервная копия: $f"
+  fi
+}
+write_file() {
+  local dest="$1" mode="${2:-0644}" tmp
+  mkdir -p "$(dirname "$dest")"
+  tmp="$(mktemp)"
+  cat > "$tmp"
+  if [[ ! -L "$dest" && -f "$dest" ]] && cmp -s "$tmp" "$dest"; then rm -f "$tmp"; return 0; fi
+  if [[ -e "$dest" || -L "$dest" ]]; then
+    backup_file "$dest"
+    # Replace symlinks themselves rather than writing through them into another path.
+    [[ ! -L "$dest" ]] || rm -f -- "$dest"
+  fi
+  install -m "$mode" "$tmp" "$dest"
+  rm -f "$tmp"
+}
 
-cat > /usr/local/bin/launcher.sh <<'EOF'
-#!/bin/sh
-# повторное нажатие закрывает wofi
-if pgrep -x wofi >/dev/null 2>&1; then
-  pkill -x wofi
-  exit 0
+log "Пользователь: $TARGET_USER ($TARGET_HOME)"
+log "Резервные копии конфигураций будут сохранены в $BACKUP_ROOT"
+
+# multilib нужен Steam для 32-битных библиотек. Существующие настройки сохраняются.
+if ! grep -qE '^[[:space:]]*\[multilib\]' /etc/pacman.conf; then
+  backup_file /etc/pacman.conf
+  if grep -qE '^[[:space:]]*#\[multilib\]' /etc/pacman.conf; then
+    sed -i '/^[[:space:]]*#\[multilib\]/,/^[[:space:]]*#Include/s/^[[:space:]]*#//' /etc/pacman.conf
+  else
+    printf '\n[multilib]\nInclude = /etc/pacman.d/mirrorlist\n' >> /etc/pacman.conf
+  fi
 fi
-exec wofi --show drun
-EOF
-chmod 755 /usr/local/bin/launcher.sh
 
-# ---------- файловый менеджер Files ----------
-cat > /usr/local/bin/files <<'EOF'
-#!/usr/bin/python3
-import json
-import os
-import pwd
-import re
-import shutil
-import stat
-import subprocess
-import sys
-import threading
-import time
+log "Полное обновление Arch (необходимое условие корректной установки пакетов)"
+pacman -Syu --needed --noconfirm
+
+# Сначала фиксируем Intel Vulkan/OpenGL-провайдеры отдельной транзакцией.
+# Это не даёт pacman выбрать NVIDIA как провайдера Steam при разрешении зависимостей.
+INTEL_GRAPHICS_PACKAGES=(mesa vulkan-intel lib32-mesa lib32-vulkan-intel intel-media-driver)
+log "Установка только Intel-графического стека"
+pacman -S --needed --noconfirm "${INTEL_GRAPHICS_PACKAGES[@]}"
+
+CORE_PACKAGES=(
+  hyprland xdg-desktop-portal-hyprland xdg-desktop-portal-gtk xorg-xwayland
+  waybar wofi alacritty qt6-wayland
+  pipewire pipewire-pulse wireplumber
+  grim slurp wl-clipboard brightnessctl
+  swaybg
+  gtk3 python python-gobject
+  udisks2 gvfs xdg-utils xdg-user-dirs desktop-file-utils
+  dbus libnotify power-profiles-daemon sudo polkit-gnome lua mako qt6ct
+  fastfetch cava curl playerctl metadata-cleaner
+  ttf-dejavu ttf-jetbrains-mono-nerd noto-fonts-emoji
+  adwaita-icon-theme
+  firefox telegram-desktop prismlauncher jre21-openjdk
+)
+log "Установка базовой системы и основных приложений"
+pacman -S --needed --noconfirm "${CORE_PACKAGES[@]}"
+fc-cache -f >/dev/null 2>&1 || true
+log "Установка Steam после закрепления Intel 64/32-bit Vulkan-провайдеров"
+pacman -S --needed --noconfirm steam
+usermod -aG wheel "$TARGET_USER"
+SUDOERS_FILE="/etc/sudoers.d/10-hypr-minimal-wheel"
+if [[ ! -e "$SUDOERS_FILE" ]]; then
+  printf '%%wheel ALL=(ALL:ALL) ALL\n' > "$SUDOERS_FILE"
+  chmod 0440 "$SUDOERS_FILE"
+  if ! visudo -cf "$SUDOERS_FILE" >/dev/null; then
+    rm -f "$SUDOERS_FILE"
+    die "Не удалось проверить правило sudoers; файл удалён."
+  fi
+fi
+
+# Строго выбираем Intel: если iGPU не обнаружена, не запускаем конфигурацию с возможным fallback на NVIDIA.
+[[ "$(uname -m)" == "x86_64" ]] || die "Поддерживается только x86_64."
+INTEL_DRM_CARD="/dev/dri/by-path/pci-0000:00:02.0-card"
+[[ -e "$INTEL_DRM_CARD" ]] || die "Не найден DRM-узел Intel UHD ($INTEL_DRM_CARD). Отказ от настройки, чтобы не допустить fallback на NVIDIA. Проверь i915 и /dev/dri/by-path."
+INTEL_CARD_REAL="$(readlink -f "$INTEL_DRM_CARD")"
+INTEL_CARD_NAME="${INTEL_CARD_REAL##*/}"
+INTEL_VENDOR="$(cat "/sys/class/drm/$INTEL_CARD_NAME/device/vendor" 2>/dev/null || true)"
+[[ "$INTEL_VENDOR" == "0x8086" ]] || die "Устройство $INTEL_DRM_CARD не подтверждено как Intel (vendor=$INTEL_VENDOR)."
+INTEL_ICD="/usr/share/vulkan/icd.d/intel_icd.json"
+[[ -r "$INTEL_ICD" ]] || die "Не найден Intel Vulkan ICD ($INTEL_ICD), хотя vulkan-intel был запрошен."
+
+# Утилиты для локальных .pkg.tar.* устанавливаются только после явного подтверждения.
+install -d -m 0755 "$LIB_ROOT" "$APP_ROOT"
+write_file "$BIN_ROOT/arch-package-install" 0755 <<'PKG_INSTALL'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+f="${1:-}"
+[[ -n "$f" ]] || { echo "Не передан файл пакета."; read -r -p "Enter для выхода "; exit 2; }
+f="$(realpath -- "$f")"
+[[ -f "$f" && -r "$f" ]] || { echo "Файл не найден или недоступен: $f"; read -r -p "Enter для выхода "; exit 2; }
+case "$f" in
+  *.pkg.tar.zst|*.pkg.tar.xz|*.pkg.tar.gz|*.pkg.tar)
+    ;;
+  *) echo "Неподдерживаемый формат. Ожидается .pkg.tar.zst/.xz/.gz."; read -r -p "Enter для выхода "; exit 2 ;;
+esac
+echo "Локальный пакет: $f"
+echo "Проверяю архив..."
+if ! bsdtar -tf "$f" >/dev/null 2>&1; then
+  echo "Архив повреждён или имеет неверный формат."
+  read -r -p "Enter для выхода "; exit 1
+fi
+echo
+read -r -p "Передать пакет pacman для установки? [y/N] " answer
+[[ "$answer" =~ ^[YyДд]$ ]] || { echo "Отменено."; read -r -p "Enter для выхода "; exit 0; }
+if sudo pacman -U -- "$f"; then
+  echo "Установка завершена."
+else
+  rc=$?
+  echo "pacman завершился с кодом $rc. Проверка подписей и системные настройки pacman не изменялись."
+  read -r -p "Enter для выхода "
+  exit "$rc"
+fi
+read -r -p "Enter для выхода "
+PKG_INSTALL
+
+# Небольшой Python GTK файловый менеджер. Файловые операции выполняются от обычного пользователя.
+write_file "$LIB_ROOT/files.py" 0644 <<'FILES_PY'
+#!/usr/bin/env python3
+import os, sys, shutil, subprocess, mimetypes, json
 from urllib.parse import unquote
+from pathlib import Path
 import gi
 gi.require_version("Gtk", "3.0")
-gi.require_version("Gdk", "3.0")
-from gi.repository import Gdk, Gio, GLib, Gtk, Pango
+gi.require_version("Gio", "2.0")
+from gi.repository import Gtk, Gio, Gdk, GLib
 
-HOME = os.path.realpath(os.path.expanduser("~"))
-TRASH = os.path.join(HOME, ".local", "share", "Trash")
-TRASH_FILES = os.path.join(TRASH, "files")
-TRASH_INFO = os.path.join(TRASH, "info")
-CONF = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "files")
-MARKS = os.path.join(CONF, "bookmarks")
-DND = [Gtk.TargetEntry.new("text/uri-list", 0, 0)]
-ACT_COPY, ACT_MOVE = Gdk.DragAction.COPY, Gdk.DragAction.MOVE
+HOME = Path.home()
+TRASH = HOME / ".local/share/Trash"
+FILES, INFO = TRASH / "files", TRASH / "info"
+BOOKMARKS = HOME / ".config/files/bookmarks"
 CSS = b"""
-* { font-family: "DejaVu Sans Mono", monospace; font-size: 11px; }
-window { background-color: rgba(13,17,27,0.82); color: #cdd6f4; }
-window.dialog, window.messagedialog { background-color: rgb(17,22,34); }
-.bar { padding: 8px 10px 4px 10px; }
-button { background-image: none; background-color: rgba(137,180,250,0.06); color: #cdd6f4;
-border: 1px solid rgba(137,180,250,0.25); border-radius: 14px; box-shadow: none;
-padding: 2px 10px; min-height: 0; min-width: 0; }
-button:hover { background-color: rgba(137,180,250,0.16); }
-button:checked { background-color: rgba(137,180,250,0.30); }
-entry { background-image: none; background-color: rgba(137,180,250,0.06); color: #cdd6f4;
-border: 1px solid rgba(137,180,250,0.25); border-radius: 14px; box-shadow: none;
-padding: 2px 12px; min-height: 0; }
-entry:focus { border-color: #89b4fa; }
-.side { background-color: rgba(137,180,250,0.04); border-right: 1px solid rgba(137,180,250,0.15); }
-.side row { padding: 5px 10px; margin: 1px 8px; border-radius: 10px; background: transparent; }
-.side row:hover { background-color: rgba(137,180,250,0.10); }
-.side row:selected { background-color: rgba(137,180,250,0.25); color: #ffffff; }
-.side row:drop(active) { background-color: rgba(137,180,250,0.35); }
-.sect { color: #7f8fae; font-size: 9px; padding: 10px 18px 2px 18px; }
-treeview.view { background-color: transparent; color: #cdd6f4; }
-treeview.view:hover { background-color: rgba(137,180,250,0.08); }
-treeview.view:selected { background-color: rgba(137,180,250,0.28); color: #ffffff; }
-treeview.view:drop(active) { border: 1px solid rgba(137,180,250,0.80); }
-treeview.view.dnd { border: 1px solid rgba(137,180,250,0.80); }
-treeview header button { background-color: transparent; border: none; border-radius: 0;
-border-bottom: 1px solid rgba(137,180,250,0.18); color: #7f8fae; padding: 3px 8px; }
-scrolledwindow, viewport { background-color: transparent; }
-scrollbar slider { background-color: rgba(137,180,250,0.35); border-radius: 4px; min-width: 6px; min-height: 6px; }
-scrollbar { background: transparent; border: none; }
-.status { color: #7f8fae; padding: 3px 14px 6px 14px; }
-.err { color: #f38ba8; }
-.dim { color: #7f8fae; }
-menu, .menu { background-color: rgb(17,22,34); color: #cdd6f4; border: 1px solid rgba(137,180,250,0.30);
-border-radius: 8px; padding: 4px; }
-menuitem { padding: 4px 10px; border-radius: 6px; }
-menuitem:hover { background-color: rgba(137,180,250,0.18); }
-separator { background-color: rgba(137,180,250,0.15); min-height: 1px; }
+* { font-family: 'DejaVu Sans', sans-serif; font-size: 10pt; }
+window { background: #111512; color: #e1e7df; }
+headerbar, toolbar { background: #171d18; color: #e1e7df; }
+button { background: #202a21; color: #e1e7df; border: 1px solid #39483a; border-radius: 7px; padding: 5px 9px; }
+button:hover, button:checked { background: #354832; border-color: #82965a; }
+entry { background: #171e18; color: #e1e7df; border: 1px solid #526447; border-radius: 6px; padding: 6px; }
+treeview { background: #111512; color: #e1e7df; }
+treeview:selected { background: #405238; color: #fff; }
+.sidebar { background: #151b16; }
+.dim-label { color: #a0aa9d; }
 """
-PLACES = [
-    ("user-home-symbolic", "Домашняя папка", HOME),
-    ("user-desktop-symbolic", "Рабочий стол", os.path.join(HOME, "Desktop")),
-    ("folder-documents-symbolic", "Документы", os.path.join(HOME, "Documents")),
-    ("folder-download-symbolic", "Загрузки", os.path.join(HOME, "Downloads")),
-    ("folder-pictures-symbolic", "Изображения", os.path.join(HOME, "Pictures")),
-    ("folder-music-symbolic", "Музыка", os.path.join(HOME, "Music")),
-    ("folder-videos-symbolic", "Видео", os.path.join(HOME, "Videos")),
-]
-SKIP_FS = ("swap", "crypto_LUKS", "LVM2_member", "linux_raid_member")
-
+def css():
+    p = Gtk.CssProvider()
+    p.load_from_data(CSS)
+    Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), p, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
 def human(n):
-    units = ("Б", "КБ", "МБ", "ГБ", "ТБ")
-    for i, u in enumerate(units):
-        if n < 1024 or i == len(units) - 1:
-            return f"{n:.0f} {u}" if i == 0 else f"{n:.1f} {u}"
+    for unit in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
+        if n < 1024: return f"{n:.0f} {unit}"
         n /= 1024
+    return f"{n:.1f} ПБ"
 
-
-def unique(dest_dir, name):
+def unique_path(folder, name):
+    p = folder / name
+    if not p.exists(): return p
     base, ext = os.path.splitext(name)
-    cand, i = name, 1
-    while os.path.lexists(os.path.join(dest_dir, cand)):
-        cand = f"{base} ({i}){ext}"
-        i += 1
-    return os.path.join(dest_dir, cand)
+    i = 1
+    while (folder / f"{base} ({i}){ext}").exists(): i += 1
+    return folder / f"{base} ({i}){ext}"
 
-
-def is_real_dir(p):
-    return os.path.isdir(p) and not os.path.islink(p)
-
-
-def in_trash(p):
-    return p == TRASH_FILES or p.startswith(TRASH_FILES + os.sep)
-
-
-def err_text(e):
-    return getattr(e, "message", None) or str(e)
-
-
-def remove_path(p):
-    if is_real_dir(p):
-        shutil.rmtree(p)
-    else:
-        os.remove(p)
-
-
-def drop_trashinfo(src):
-    if os.path.dirname(src) == TRASH_FILES:
-        try:
-            os.remove(os.path.join(TRASH_INFO, os.path.basename(src) + ".trashinfo"))
-        except OSError:
-            pass
-
-
-def transfer(paths, dest, move):
-    """Копирует или переносит paths в папку dest. Возвращает (сколько сделано, [ошибки])."""
-    done, errs = 0, []
-    to_trash = in_trash(dest)
-    rdest = os.path.realpath(dest)
-    for src in paths:
-        try:
-            if not os.path.lexists(src):
-                raise OSError("нет такого файла: " + os.path.basename(src))
-            if to_trash:
-                if not in_trash(src):
-                    Gio.File.new_for_path(src).trash(None)
-                    done += 1
-                continue
-            if move and os.path.realpath(os.path.dirname(src)) == rdest:
-                continue
-            dst = unique(dest, os.path.basename(src))
-            rsrc = os.path.realpath(src)
-            if is_real_dir(src) and (rdest + os.sep).startswith(rsrc + os.sep):
-                raise OSError("нельзя поместить папку саму в себя")
-            if move:
-                shutil.move(src, dst)
-                drop_trashinfo(src)
-            elif is_real_dir(src):
-                shutil.copytree(src, dst, symlinks=True)
-            else:
-                shutil.copy2(src, dst, follow_symlinks=False)
-            done += 1
-        except Exception as e:
-            errs.append(err_text(e))
-    return done, errs
-
-
-def restore(path):
-    """Возвращает файл из корзины на прежнее место."""
-    if os.path.dirname(path) != TRASH_FILES:
-        raise OSError("восстановить можно только то, что лежит в корне корзины")
-    info = os.path.join(TRASH_INFO, os.path.basename(path) + ".trashinfo")
-    orig = None
-    try:
-        with open(info, encoding="utf-8", errors="replace") as f:
-            for line in f:
-                if line.startswith("Path="):
-                    orig = unquote(line[5:].strip())
-                    break
-    except OSError:
-        pass
-    if not orig or not os.path.isabs(orig):
-        raise OSError("неизвестно, откуда этот файл")
-    parent = os.path.dirname(orig)
-    os.makedirs(parent, exist_ok=True)
-    dst = unique(parent, os.path.basename(orig))
-    shutil.move(path, dst)
-    try:
-        os.remove(info)
-    except OSError:
-        pass
-    return dst
-
-
-def empty_trash():
-    errs = []
-    for d in (TRASH_FILES, TRASH_INFO):
-        try:
-            names = os.listdir(d)
-        except OSError:
-            continue
-        for n in names:
-            try:
-                remove_path(os.path.join(d, n))
-            except Exception as e:
-                errs.append(err_text(e))
-    return errs
-
-
-def tree_stats(paths, stop):
-    size = files = dirs = 0
-    stack = list(paths)
-    while stack and not stop.is_set():
-        p = stack.pop()
-        try:
-            st = os.lstat(p)
-        except OSError:
-            continue
-        if stat.S_ISDIR(st.st_mode):
-            dirs += 1
-            try:
-                with os.scandir(p) as it:
-                    stack.extend(e.path for e in it)
-            except OSError:
-                pass
-        else:
-            files += 1
-            size += st.st_size
-    return size, files, dirs
-
-
-def load_marks():
-    try:
-        with open(MARKS, encoding="utf-8") as f:
-            return [ln.strip() for ln in f if ln.strip().startswith("/")]
-    except OSError:
-        return []
-
-
-def save_marks(marks):
-    try:
-        os.makedirs(CONF, exist_ok=True)
-        with open(MARKS, "w", encoding="utf-8") as f:
-            f.write("".join(m + "\n" for m in marks))
-    except OSError:
-        pass
-
-
-def uris_to_paths(data):
-    out = []
-    for u in data.get_uris() or []:
-        p = Gio.File.new_for_uri(u).get_path()
-        if p:
-            out.append(p)
-    return out
-
-
-def drag_status(ctx, action, t):
-    f = getattr(Gdk, "drag_status", None)
-    if f is not None:
-        f(ctx, action, t)
-    else:
-        ctx.drag_status(action, t)
-
-
-def list_devices():
-    try:
-        out = subprocess.run(["lsblk", "-J", "-o", "NAME,LABEL,SIZE,FSTYPE,MOUNTPOINT,PATH"],
-                             capture_output=True, text=True, timeout=5).stdout
-        data = json.loads(out)
-    except Exception:
-        return []
-    res = []
-
-    def walk(nodes):
-        for n in nodes:
-            mp = n.get("mountpoint") or next((m for m in (n.get("mountpoints") or []) if m), None)
-            fs = n.get("fstype")
-            if fs and fs not in SKIP_FS and (not mp or mp.startswith(("/media", "/run/media", "/mnt"))):
-                res.append(dict(path=n.get("path"), label=n.get("label") or n.get("name"),
-                                size=n.get("size") or "", fstype=fs, mp=mp))
-            walk(n.get("children") or [])
-    walk(data.get("blockdevices", []))
-    return res
-
-
-class Item:
-    __slots__ = ("name", "path", "isdir", "size", "mtime", "icon")
-
-    def __init__(self, name, path, isdir, size, mtime, icon):
-        self.name, self.path, self.isdir, self.size, self.mtime, self.icon = name, path, isdir, size, mtime, icon
-
+def trash_path(path):
+    FILES.mkdir(parents=True, exist_ok=True); INFO.mkdir(parents=True, exist_ok=True)
+    dest = unique_path(FILES, path.name)
+    Gio.File.new_for_path(str(path)).trash(None)
+    return dest
 
 class FilesWindow(Gtk.Window):
-    def __init__(self, start, select=None):
+    def __init__(self, start):
         super().__init__(title="Files")
-        self.set_default_size(1040, 660)
-        self.set_decorated(False)
-        self.cwd = None
-        self.hist, self.fwd = [], []
-        self.hidden = False
-        self.sort = ("name", False)
-        self.clip = ([], False)
-        self.devs = []
-        self.marks = load_marks()
-        self.sizes = {}
-        self.drag_paths = []
-        self.drag_xy = (0, 0)
-        self.scroll_id = 0
-        screen = self.get_screen()
-        visual = screen.get_rgba_visual()
-        if visual:
-            self.set_visual(visual)
-        self.apply_css(screen)
-        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        self.add(root)
-        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        bar.get_style_context().add_class("bar")
-        self.b_back = self.icon_button("go-previous-symbolic", self.go_back)
-        self.b_fwd = self.icon_button("go-next-symbolic", self.go_forward)
-        self.b_up = self.icon_button("go-up-symbolic", self.go_up)
-        self.entry = Gtk.Entry()
-        self.entry.set_hexpand(True)
-        self.entry.connect("activate", self.on_entry)
-        self.b_new = self.icon_button("folder-new-symbolic", lambda *_: self.new_folder())
-        self.b_new.set_tooltip_text("Новая папка (Ctrl+Shift+N)")
-        self.b_newf = self.icon_button("document-new-symbolic", lambda *_: self.new_file())
-        self.b_newf.set_tooltip_text("Новый файл")
-        self.b_hidden = Gtk.ToggleButton()
-        self.b_hidden.add(Gtk.Image.new_from_icon_name("view-reveal-symbolic", Gtk.IconSize.BUTTON))
-        self.b_hidden.set_tooltip_text("Скрытые файлы (Ctrl+H)")
-        self.b_hidden.connect("toggled", self.on_hidden_toggled)
-        for w in (self.b_back, self.b_fwd, self.b_up):
-            bar.pack_start(w, False, False, 0)
-        bar.pack_start(self.entry, True, True, 0)
-        bar.pack_start(self.b_new, False, False, 0)
-        bar.pack_start(self.b_newf, False, False, 0)
-        bar.pack_start(self.b_hidden, False, False, 0)
+        self.set_default_size(1000, 650)
+        self.cwd = Path(start).expanduser().resolve()
+        FILES.mkdir(parents=True,exist_ok=True); INFO.mkdir(parents=True,exist_ok=True)
+        self.clipboard_paths, self.cut = [], False
+        self.sort_col, self.sort_reverse = 0, False
+        self.store = Gtk.ListStore(str, str, str, bool, str)
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6); self.add(root)
+        bar = Gtk.Box(spacing=5); bar.set_margin_top(8); bar.set_margin_start(8); bar.set_margin_end(8)
         root.pack_start(bar, False, False, 0)
-        paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
-        root.pack_start(paned, True, True, 0)
-        self.side = Gtk.ListBox()
-        self.side.set_selection_mode(Gtk.SelectionMode.SINGLE)
-        self.side.get_style_context().add_class("side")
-        self.side.connect("row-activated", self.on_side_activated)
-        self.side.connect("button-press-event", self.on_side_click)
-        self.side.drag_dest_set(Gtk.DestDefaults.DROP, DND, ACT_COPY | ACT_MOVE)
-        self.side.connect("drag-motion", self.on_side_motion)
-        self.side.connect("drag-leave", self.on_side_leave)
-        self.side.connect("drag-data-received", self.on_side_received)
-        side_scroll = Gtk.ScrolledWindow()
-        side_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        side_scroll.add(self.side)
-        side_scroll.set_size_request(190, -1)
-        paned.pack1(side_scroll, False, False)
-        self.build_side()
-        self.store = Gtk.ListStore(Gio.Icon, str, str, str, bool, str)
-        self.view = Gtk.TreeView(model=self.store)
-        self.view.set_enable_search(True)
-        self.view.set_search_column(1)
-        self.view.set_rubber_banding(True)
+        for label, cb in (("←", self.back), ("↑", self.up), ("Обновить", self.refresh)):
+            b=Gtk.Button(label=label); b.connect("clicked", lambda _b, f=cb: f()); bar.pack_start(b, False, False, 0)
+        self.path_entry=Gtk.Entry(); self.path_entry.set_text(str(self.cwd)); self.path_entry.connect("activate", self.go_entry)
+        bar.pack_start(self.path_entry, True, True, 0)
+        new=Gtk.Button(label="Новая папка"); new.connect("clicked", self.new_folder); bar.pack_start(new, False, False, 0)
+        split=Gtk.Paned(); root.pack_start(split, True, True, 0)
+        self.side=Gtk.ListBox(); self.side.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.side.get_style_context().add_class("sidebar")
+        self.side.connect("row-activated", self.side_open)
+        self.side.connect("button-press-event", self.side_context)
+        sw=Gtk.ScrolledWindow(); sw.set_size_request(190,-1); sw.add(self.side); split.pack1(sw,False,False)
+        right=Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4); split.pack2(right,True,False)
+        self.search=Gtk.SearchEntry(); self.search.set_placeholder_text("Поиск в текущей папке…")
+        self.search.connect("search-changed", self.refresh); right.pack_start(self.search,False,False,4)
+        self.view=Gtk.TreeView(model=self.store); self.view.set_headers_clickable(True)
         self.view.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
-        self.view.connect("row-activated", self.on_row_activated)
-        self.view.connect("button-press-event", self.on_view_click)
-        self.view.enable_model_drag_source(Gdk.ModifierType.BUTTON1_MASK, DND, ACT_COPY | ACT_MOVE)
-        self.view.drag_dest_set(Gtk.DestDefaults.DROP, DND, ACT_COPY | ACT_MOVE)
-        self.view.connect("drag-begin", self.on_drag_begin)
-        self.view.connect("drag-end", self.on_drag_end)
-        self.view.connect("drag-data-get", self.on_drag_get)
-        self.view.connect("drag-data-delete", self.on_drag_delete)
-        self.view.connect("drag-motion", self.on_view_motion)
-        self.view.connect("drag-leave", self.on_view_leave)
-        self.view.connect("drag-data-received", self.on_view_received)
-        self.name_col = Gtk.TreeViewColumn("Имя")
-        self.name_col.set_expand(True)
-        self.name_col.set_resizable(True)
-        pix = Gtk.CellRendererPixbuf()
-        pix.set_property("stock-size", int(Gtk.IconSize.LARGE_TOOLBAR))
-        pix.set_property("xpad", 6)
-        pix.set_property("ypad", 3)
-        self.name_r = Gtk.CellRendererText()
-        self.name_r.set_property("ellipsize", Pango.EllipsizeMode.END)
-        self.name_r.connect("edited", self.on_edited)
-        self.name_r.connect("editing-canceled", lambda *_: self.name_r.set_property("editable", False))
-        self.name_col.pack_start(pix, False)
-        self.name_col.pack_start(self.name_r, True)
-        self.name_col.add_attribute(pix, "gicon", 0)
-        self.name_col.add_attribute(self.name_r, "text", 1)
-        self.name_col.set_clickable(True)
-        self.name_col.connect("clicked", self.on_header, "name")
-        self.view.append_column(self.name_col)
-        self.size_col = self.text_column("Размер", 2, "size")
-        self.date_col = self.text_column("Изменён", 3, "date")
-        scroll = Gtk.ScrolledWindow()
-        scroll.add(self.view)
-        paned.pack2(scroll, True, False)
-        self.status = Gtk.Label(xalign=0)
-        self.status.get_style_context().add_class("status")
-        self.status.set_ellipsize(Pango.EllipsizeMode.END)
-        root.pack_start(self.status, False, False, 0)
-        # подключаем после создания строки статуса
-        self.view.get_selection().connect("changed", self.update_status)
-        self.connect("key-press-event", self.on_key)
-        self.connect("notify::is-active", lambda *_: self.refresh_devices())
-        GLib.timeout_add_seconds(20, self.on_timer)
-        self.load(start, push=False, select=select)
-        self.refresh_devices()
-        self.view.grab_focus()
+        for title, idx in (("Имя",0),("Размер",1),("Изменён",2)):
+            r=Gtk.CellRendererText()
+            col=Gtk.TreeViewColumn(title,r,text=idx); col.set_resizable(True); col.set_clickable(True)
+            col.connect("clicked",self.sort_by,idx); self.view.append_column(col)
+        self.view.connect("row-activated",self.activate)
+        self.view.connect("button-press-event",self.context_menu)
+        targets=[Gtk.TargetEntry.new("text/uri-list",0,0)]
+        self.view.enable_model_drag_source(Gdk.ModifierType.BUTTON1_MASK,targets,Gdk.DragAction.COPY|Gdk.DragAction.MOVE)
+        self.view.drag_dest_set(Gtk.DestDefaults.ALL,targets,Gdk.DragAction.COPY|Gdk.DragAction.MOVE)
+        self.view.connect("drag-data-get",self.drag_get)
+        self.view.connect("drag-data-received",self.drag_receive)
+        sw2=Gtk.ScrolledWindow(); sw2.add(self.view); right.pack_start(sw2,True,True,0)
+        self.status=Gtk.Label(xalign=0); self.status.set_margin_start(10); self.status.set_margin_bottom(6)
+        root.pack_start(self.status,False,False,0)
+        self.connect("key-press-event",self.keypress)
+        self.build_sidebar(); self.refresh()
 
-    def apply_css(self, screen):
-        for rule in re.findall(rb"[^{}]+\{[^{}]*\}", CSS):
-            prov = Gtk.CssProvider()
-            try:
-                prov.load_from_data(rule)
-            except GLib.Error:
-                continue
-            Gtk.StyleContext.add_provider_for_screen(screen, prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
-
-    def icon_button(self, icon, cb):
-        b = Gtk.Button()
-        b.add(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.BUTTON))
-        b.connect("clicked", cb)
-        return b
-
-    def text_column(self, title, idx, key):
-        r = Gtk.CellRendererText()
-        r.set_property("xalign", 1.0)
-        r.set_property("foreground", "#8fa3c4")
-        col = Gtk.TreeViewColumn(title, r, text=idx)
-        col.set_min_width(110)
-        col.set_clickable(True)
-        col.connect("clicked", self.on_header, key)
-        self.view.append_column(col)
-        return col
-
-    # ---------- боковая панель ----------
-    def side_row(self, icon, text, data):
-        row = Gtk.ListBoxRow()
-        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        box.pack_start(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.MENU), False, False, 0)
-        lab = Gtk.Label(label=text, xalign=0)
-        lab.set_ellipsize(Pango.EllipsizeMode.END)
-        box.pack_start(lab, True, True, 0)
-        row.add(box)
-        row.fm_data = data
-        return row
-
-    def side_section(self, text):
-        row = Gtk.ListBoxRow()
-        row.set_selectable(False)
-        row.set_activatable(False)
-        lab = Gtk.Label(label=text, xalign=0)
-        lab.get_style_context().add_class("sect")
-        row.add(lab)
-        return row
-
-    def build_side(self):
-        for r in self.side.get_children():
-            self.side.remove(r)
-        self.side.add(self.side_section("МЕСТА"))
-        for icon, name, path in PLACES:
-            if os.path.isdir(path):
-                self.side.add(self.side_row(icon, name, ("dir", path)))
-        self.side.add(self.side_row("user-trash-symbolic", "Корзина", ("dir", TRASH_FILES)))
-        if self.marks:
-            self.side.add(self.side_section("ЗАКЛАДКИ"))
-            for p in self.marks:
-                self.side.add(self.side_row("folder-symbolic", os.path.basename(p) or p, ("mark", p)))
-        if self.devs:
-            self.side.add(self.side_section("ДИСКИ"))
-            for d in self.devs:
-                label = d["label"] + (f"  {d['size']}" if d["size"] else "")
-                self.side.add(self.side_row("drive-removable-media-symbolic", label, ("dev", d)))
+    def build_sidebar(self):
+        for c in self.side.get_children(): self.side.remove(c)
+        places=[("Домашняя папка",HOME),("Рабочий стол",HOME/"Desktop"),("Документы",HOME/"Documents"),
+                ("Загрузки",HOME/"Downloads"),("Изображения",HOME/"Pictures"),("Музыка",HOME/"Music"),
+                ("Видео",HOME/"Videos"),("Корзина",FILES)]
+        for title,path in places:
+            row=Gtk.ListBoxRow(); row.add(Gtk.Label(label=title,xalign=0,margin=8)); row.path=path
+            self.side.add(row)
+        try:
+            data=json.loads(subprocess.run(["lsblk","-J","-o","PATH,LABEL,SIZE,FSTYPE,MOUNTPOINTS,RM"],capture_output=True,text=True,timeout=5,check=True).stdout)
+            def add_devices(nodes):
+                for node in nodes:
+                    if node.get("fstype") and node.get("path") and node.get("fstype") not in ("crypto_LUKS","swap","LVM2_member"):
+                        mounts=[m for m in (node.get("mountpoints") or []) if m]
+                        removable=str(node.get("rm","0"))=="1"
+                        external_mount=any(m.startswith(("/run/media/","/media/","/mnt/")) for m in mounts)
+                        if removable or external_mount:
+                            row=Gtk.ListBoxRow(); row.add(Gtk.Label(label="▤ "+(node.get("label") or Path(node["path"]).name),xalign=0,margin=8))
+                            row.device=node["path"]; row.mountpoint=mounts[0] if mounts else None; self.side.add(row)
+                    add_devices(node.get("children") or [])
+            add_devices(data.get("blockdevices") or [])
+        except Exception: pass
+        try:
+            for line in BOOKMARKS.read_text().splitlines():
+                p=Path(line)
+                if p.is_dir():
+                    row=Gtk.ListBoxRow(); row.add(Gtk.Label(label="★ "+p.name,xalign=0,margin=8)); row.path=p; row.bookmark=True
+                    self.side.add(row)
+        except OSError: pass
         self.side.show_all()
-        self.sync_side()
 
-    def sync_side(self):
-        self.side.unselect_all()
-        if not self.cwd:
-            return
-        for row in self.side.get_children():
-            data = getattr(row, "fm_data", None)
-            if data and data[0] in ("dir", "mark") and os.path.realpath(data[1]) == self.cwd:
-                self.side.select_row(row)
-                break
-
-    def refresh_devices(self):
-        threading.Thread(target=lambda: GLib.idle_add(self.show_devices, list_devices()), daemon=True).start()
-
-    def on_timer(self):
-        if self.is_active():
-            self.refresh_devices()
-        return True
-
-    def show_devices(self, devs):
-        if devs != self.devs:
-            self.devs = devs
-            self.build_side()
-        return False
-
-    def mount_and_open(self, d):
-        def work():
-            if d["mp"]:
-                GLib.idle_add(self.load, d["mp"])
-                return
-            r = subprocess.run(["udisksctl", "mount", "-b", d["path"]], capture_output=True, text=True)
-            m = re.search(r" at (.+?)\.?\s*$", r.stdout.strip())
-            if r.returncode == 0 and m:
-                GLib.idle_add(self.load, m.group(1))
-                GLib.idle_add(self.refresh_devices)
+    def side_open(self,_box,row):
+        if not row: return
+        if hasattr(row,"device"):
+            if row.mountpoint:
+                self.load(row.mountpoint)
             else:
-                GLib.idle_add(self.say, (r.stderr.strip() or "Не удалось подключить").splitlines()[0], True)
-        threading.Thread(target=work, daemon=True).start()
+                r=subprocess.run(["udisksctl","mount","-b",row.device],capture_output=True,text=True)
+                if r.returncode==0:
+                    import re
+                    m=re.search(r" at (.+?)\.?\s*$",r.stdout.strip())
+                    if m: self.load(m.group(1))
+                    self.build_sidebar()
+                else: self.message((r.stderr or r.stdout).strip() or "Не удалось подключить накопитель")
+        elif hasattr(row,"path") and row.path.exists(): self.load(row.path)
 
-    def unmount(self, d):
-        def work():
-            r = subprocess.run(["udisksctl", "unmount", "-b", d["path"]], capture_output=True, text=True)
-            if r.returncode == 0:
-                GLib.idle_add(self.say, "Отключено: " + d["label"], False)
-                if self.cwd and d["mp"] and self.cwd.startswith(d["mp"]):
-                    GLib.idle_add(self.load, HOME)
-                GLib.idle_add(self.refresh_devices)
-            else:
-                GLib.idle_add(self.say, (r.stderr.strip() or "Не удалось отключить").splitlines()[0], True)
-        threading.Thread(target=work, daemon=True).start()
-
-    def on_side_activated(self, box, row):
-        data = getattr(row, "fm_data", None)
-        if not data:
-            return
-        kind, val = data
-        if kind == "dev":
-            self.mount_and_open(val)
-            return
-        if val == TRASH_FILES:
-            os.makedirs(val, exist_ok=True)
-        if os.path.isdir(val):
-            self.load(val)
+    def side_context(self,_box,event):
+        if event.button!=3:return False
+        row=self.side.get_row_at_y(int(event.y))
+        if not row:return False
+        menu=Gtk.Menu()
+        if hasattr(row,"bookmark"):
+            item=Gtk.MenuItem(label="Убрать закладку")
+            def unmount(*_):
+                marks=BOOKMARKS.read_text().splitlines() if BOOKMARKS.exists() else []
+                BOOKMARKS.write_text("\n".join(x for x in marks if x!=str(row.path))+"\n")
+                self.build_sidebar()
+            item.connect("activate",unmount);menu.append(item);menu.show_all();menu.popup_at_pointer(event);return True
+        if not hasattr(row,"device"):return False
+        if row.mountpoint:
+            item=Gtk.MenuItem(label="Отключить накопитель")
+            def unmount(*_):
+                r=subprocess.run(["udisksctl","unmount","-b",row.device],capture_output=True,text=True)
+                if r.returncode==0:
+                    if str(self.cwd).startswith(row.mountpoint):self.load(HOME)
+                    self.build_sidebar()
+                else:self.message((r.stderr or r.stdout).strip() or "Не удалось отключить накопитель")
         else:
-            self.say("Папка недоступна: " + val, True)
+            item=Gtk.MenuItem(label="Подключить накопитель")
+            def unmount(*_):self.side_open(self.side,row)
+        item.connect("activate",unmount);menu.append(item);menu.show_all();menu.popup_at_pointer(event);return True
+    def load(self,path):
+        p=Path(path).expanduser()
+        if not p.is_dir(): return
+        self.cwd=p.resolve(); self.path_entry.set_text(str(self.cwd)); self.refresh()
 
-    def on_side_click(self, box, ev):
-        if ev.button != 3:
-            return False
-        row = box.get_row_at_y(int(ev.y))
-        data = getattr(row, "fm_data", None) if row else None
-        if not data:
-            return False
-        kind, val = data
-        menu = Gtk.Menu()
-
-        def add(label, cb):
-            it = Gtk.MenuItem(label=label)
-            it.connect("activate", lambda *_: cb())
-            menu.append(it)
-        if kind == "dev":
-            if val["mp"]:
-                add("Отключить", lambda: self.unmount(val))
-            else:
-                add("Подключить", lambda: self.mount_and_open(val))
-        elif kind == "mark":
-            add("Убрать из закладок", lambda: self.toggle_mark(val))
-        elif val == TRASH_FILES:
-            add("Очистить корзину", self.empty_trash_ask)
-        else:
-            return False
-        menu.show_all()
-        menu.popup_at_pointer(ev)
-        return True
-
-    # ---------- перетаскивание ----------
-    def on_drag_begin(self, view, ctx):
-        self.drag_paths = self.selected_paths()
-
-    def on_drag_end(self, view, ctx):
-        self.drag_paths = []
-        self.stop_scroll()
-        view.set_drag_dest_row(None, Gtk.TreeViewDropPosition.BEFORE)
-
-    def on_drag_get(self, view, ctx, data, info, t):
-        paths = self.drag_paths or self.selected_paths()
-        data.set_uris([Gio.File.new_for_path(p).get_uri() for p in paths])
-
-    def on_drag_delete(self, view, ctx):
-        # файлы переносим сами, строки из списка удалять не нужно
-        view.stop_emission_by_name("drag-data-delete")
-
-    def copy_wanted(self):
-        if not self.drag_paths:
-            return True
-        try:
-            seat = Gdk.Display.get_default().get_default_seat()
-            _, _, _, mask = self.get_window().get_device_position(seat.get_pointer())
-            return bool(mask & Gdk.ModifierType.CONTROL_MASK)
-        except Exception:
-            return False
-
-    def can_drop(self, dest, copy):
-        if not dest:
-            return False
-        paths = self.drag_paths
-        if in_trash(dest):
-            return bool(paths) and not all(in_trash(p) for p in paths)
-        if not os.access(dest, os.W_OK | os.X_OK):
-            return False
-        rd = os.path.realpath(dest)
-        for p in paths:
-            rp = os.path.realpath(p)
-            if rd == rp or rd.startswith(rp + os.sep):
-                return False
-        if paths and not copy and all(os.path.realpath(os.path.dirname(p)) == rd for p in paths):
-            return False
-        return True
-
-    def pick_action(self, ctx, copy):
-        want = ACT_COPY if copy else ACT_MOVE
-        if ctx.get_actions() & want:
-            return want
-        return ctx.get_suggested_action() & (ACT_COPY | ACT_MOVE)
-
-    def view_dest(self, view, x, y):
-        hit = view.get_dest_row_at_pos(x, y)
-        if hit:
-            path = hit[0]
-            row = self.store[path]
-            if row[4] and row[5] not in self.drag_paths:
-                return row[5], path
-        return self.cwd, None
-
-    def on_view_motion(self, view, ctx, x, y, t):
-        dest, path = self.view_dest(view, x, y)
-        copy = self.copy_wanted()
-        ok = self.can_drop(dest, copy)
-        view.set_drag_dest_row(path if ok else None, Gtk.TreeViewDropPosition.INTO_OR_AFTER)
-        drag_status(ctx, self.pick_action(ctx, copy) if ok else 0, t)
-        self.drag_xy = (x, y)
-        self.start_scroll()
-        return True
-
-    def on_view_leave(self, view, ctx, t):
-        view.set_drag_dest_row(None, Gtk.TreeViewDropPosition.BEFORE)
-        self.stop_scroll()
-
-    def on_view_received(self, view, ctx, x, y, data, info, t):
-        view.set_drag_dest_row(None, Gtk.TreeViewDropPosition.BEFORE)
-        self.stop_scroll()
-        dest, _ = self.view_dest(view, x, y)
-        self.do_drop(uris_to_paths(data), dest, ctx.get_selected_action())
-
-    def side_dest(self, y):
-        row = self.side.get_row_at_y(int(y))
-        data = getattr(row, "fm_data", None) if row else None
-        if not data:
-            return None, None
-        kind, val = data
-        if kind == "dev":
-            return (val["mp"], row) if val["mp"] else (None, None)
-        if val == TRASH_FILES or os.path.isdir(val):
-            return val, row
-        return None, None
-
-    def on_side_motion(self, box, ctx, x, y, t):
-        dest, row = self.side_dest(y)
-        copy = self.copy_wanted()
-        ok = self.can_drop(dest, copy)
-        if ok and row:
-            box.drag_highlight_row(row)
-        else:
-            box.drag_unhighlight_row()
-        drag_status(ctx, self.pick_action(ctx, copy) if ok else 0, t)
-        return True
-
-    def on_side_leave(self, box, ctx, t):
-        box.drag_unhighlight_row()
-
-    def on_side_received(self, box, ctx, x, y, data, info, t):
-        box.drag_unhighlight_row()
-        dest, _ = self.side_dest(y)
-        self.do_drop(uris_to_paths(data), dest, ctx.get_selected_action())
-
-    def do_drop(self, paths, dest, action):
-        if not paths or not dest:
-            return
-        copy = bool(action & ACT_COPY)
-        if not self.can_drop(dest, copy) and self.drag_paths:
-            return
-        if not in_trash(dest) and not os.access(dest, os.W_OK | os.X_OK):
-            self.say("Нет прав на запись: " + dest, True)
-            return
-        self.run_transfer(paths, dest, not copy)
-
-    def start_scroll(self):
-        if not self.scroll_id:
-            self.scroll_id = GLib.timeout_add(60, self.autoscroll)
-
-    def stop_scroll(self):
-        if self.scroll_id:
-            GLib.source_remove(self.scroll_id)
-            self.scroll_id = 0
-
-    def autoscroll(self):
-        adj = self.view.get_vadjustment()
-        y = self.drag_xy[1]
-        h = self.view.get_allocated_height()
-        step = -18 if y < 45 else (18 if y > h - 35 else 0)
-        if step:
-            top = max(adj.get_lower(), adj.get_upper() - adj.get_page_size())
-            adj.set_value(max(adj.get_lower(), min(top, adj.get_value() + step)))
-        return True
-
-    # ---------- чтение папки ----------
-    def say(self, text, err=False):
-        ctx = self.status.get_style_context()
-        if err:
-            ctx.add_class("err")
-        else:
-            ctx.remove_class("err")
-        self.status.set_text(text)
-        return False
-
-    def read_dir(self, path):
-        attrs = ("standard::name,standard::type,standard::size,standard::symbolic-icon,"
-                 "standard::icon,time::modified")
-        items = []
-        en = Gio.File.new_for_path(path).enumerate_children(attrs, Gio.FileQueryInfoFlags.NONE, None)
-        while True:
-            info = en.next_file(None)
-            if info is None:
-                break
-            name = info.get_name()
-            if not self.hidden and name.startswith("."):
-                continue
-            icon = info.get_symbolic_icon() or info.get_icon()
-            items.append(Item(name, os.path.join(path, name),
-                              info.get_file_type() == Gio.FileType.DIRECTORY,
-                              info.get_size(), info.get_attribute_uint64("time::modified"), icon))
-        en.close(None)
-        return items
-
-    def sort_items(self, items):
-        key, rev = self.sort
-        if key == "size":
-            kf = lambda i: (i.size, i.name.lower())
-        elif key == "date":
-            kf = lambda i: (i.mtime, i.name.lower())
-        else:
-            kf = lambda i: i.name.lower()
-        dirs = sorted([i for i in items if i.isdir], key=kf, reverse=rev)
-        files = sorted([i for i in items if not i.isdir], key=kf, reverse=rev)
-        return dirs + files
-
-    def load(self, path, push=True, select=None):
-        path = os.path.realpath(os.path.expanduser(path))
-        try:
-            items = self.read_dir(path)
-        except GLib.Error as e:
-            self.say(f"Нет доступа: {path} ({e.message})", True)
-            return False
-        if push and self.cwd and self.cwd != path:
-            self.hist.append(self.cwd)
-            self.fwd = []
-        self.cwd = path
-        self.sizes = {i.path: i.size for i in items if not i.isdir}
+    def refresh(self,*_):
         self.store.clear()
-        for it in self.sort_items(items):
-            self.store.append([it.icon, it.name, "" if it.isdir else human(it.size),
-                               time.strftime("%d.%m.%Y %H:%M", time.localtime(it.mtime)), it.isdir, it.path])
-        shown = path.replace(HOME, "~", 1) if path.startswith(HOME) else path
-        self.entry.set_text(shown)
-        self.set_title(os.path.basename(path) or "/")
-        self.b_back.set_sensitive(bool(self.hist))
-        self.b_fwd.set_sensitive(bool(self.fwd))
-        self.b_up.set_sensitive(path != "/")
-        self.sync_side()
-        if select:
-            self.select_name(select)
-        self.update_status()
-        self.view.grab_focus()
-        return False
+        try: entries=list(self.cwd.iterdir())
+        except OSError as e: self.status.set_text(str(e)); return
+        query=self.search.get_text().casefold()
+        entries=[p for p in entries if query in p.name.casefold()]
+        def order_key(p):
+            try:
+                st=p.stat()
+                value=p.name.casefold() if self.sort_col==0 else (st.st_size if self.sort_col==1 else st.st_mtime)
+            except OSError: value=0
+            return (not p.is_dir(), value)
+        entries.sort(key=order_key,reverse=self.sort_reverse)
+        for p in entries:
+            try:
+                st=p.lstat(); size="—" if p.is_dir() else human(st.st_size)
+                date=GLib.DateTime.new_from_unix_local(int(st.st_mtime)).format("%Y-%m-%d %H:%M")
+                self.store.append([p.name,size,date,p.is_dir(),str(p)])
+            except OSError: continue
+        self.status.set_text(f"{len(entries)} объектов · {self.cwd}")
 
-    def reload(self, select=None):
-        self.load(self.cwd, push=False, select=select)
+    def sort_by(self,_col,idx):
+        self.sort_reverse=not self.sort_reverse if self.sort_col==idx else False
+        self.sort_col=idx; self.refresh()
 
-    def select_name(self, name):
-        for row in self.store:
-            if row[1] == name:
-                sel = self.view.get_selection()
-                sel.unselect_all()
-                sel.select_path(row.path)
-                self.view.scroll_to_cell(row.path, None, False, 0, 0)
-                self.view.set_cursor(row.path)
-                return
-
-    def update_status(self, *_):
-        rows = self.selected_rows()
-        total = len(self.store)
-        if rows:
-            total_size = sum(int(self.sizes.get(self.store[r][5], 0)) for r in rows)
-            text = f"Выбрано: {len(rows)} из {total}"
-            if total_size:
-                text += f"  ·  {human(total_size)}"
-            self.say(text)
-        else:
-            self.say(f"{total} элементов" if total else "Папка пуста")
-
-    def go_back(self, *_):
-        if self.hist:
-            self.fwd.append(self.cwd)
-            self.load(self.hist.pop(), push=False)
-
-    def go_forward(self, *_):
-        if self.fwd:
-            self.hist.append(self.cwd)
-            self.load(self.fwd.pop(), push=False)
-
-    def go_up(self, *_):
-        parent = os.path.dirname(self.cwd)
-        if parent != self.cwd:
-            self.load(parent, select=os.path.basename(self.cwd))
-
-    def on_entry(self, entry):
-        p = os.path.expanduser(entry.get_text().strip())
-        if os.path.isdir(p):
-            self.load(p)
-        elif os.path.exists(p):
-            self.load(os.path.dirname(p), select=os.path.basename(p))
-        else:
-            self.say("Нет такого пути: " + p, True)
-        self.view.grab_focus()
-
-    def on_hidden_toggled(self, btn):
-        self.hidden = btn.get_active()
-        self.reload()
-
-    def on_header(self, col, key):
-        k, rev = self.sort
-        self.sort = (key, (not rev) if k == key else False)
-        for c, kk in ((self.name_col, "name"), (self.size_col, "size"), (self.date_col, "date")):
-            c.set_sort_indicator(kk == self.sort[0])
-            c.set_sort_order(Gtk.SortType.DESCENDING if self.sort[1] else Gtk.SortType.ASCENDING)
-        self.reload()
-
-    def on_row_activated(self, view, path, col):
-        row = self.store[path]
-        if row[4]:
-            self.load(row[5])
-        else:
-            self.open_path(row[5])
-
-    def open_path(self, path):
-        if path.lower().endswith((".pkg.tar.zst", ".pkg.tar.xz")) and shutil.which("pkg-install"):
-            subprocess.Popen(["pkg-install", path], start_new_session=True)
-            self.say("Устанавливаю: " + os.path.basename(path))
-            return
-        ok = False
-        try:
-            ok = Gio.AppInfo.launch_default_for_uri(Gio.File.new_for_path(path).get_uri(), None)
-        except GLib.Error:
-            ok = False
-        if ok:
-            return
-        ctype, _ = Gio.content_type_guess(path, None)
-        try:
-            if Gio.content_type_is_a(ctype, "text/plain") and shutil.which("nano"):
-                subprocess.Popen(["alacritty", "-e", "nano", path], start_new_session=True)
-            else:
-                subprocess.Popen(["firefox", path], start_new_session=True)
-        except Exception as e:
-            self.say(f"Нечем открыть ({ctype}): {e}", True)
-
-    # ---------- операции с файлами ----------
-    def selected_rows(self):
-        _, rows = self.view.get_selection().get_selected_rows()
-        return rows
-
-    def selected_paths(self):
-        return [self.store[r][5] for r in self.selected_rows()]
-
-    def confirm(self, text):
-        dlg = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.QUESTION,
-                                buttons=Gtk.ButtonsType.YES_NO, text=text)
-        resp = dlg.run()
-        dlg.destroy()
-        return resp == Gtk.ResponseType.YES
-
-    def copy(self, cut=False):
-        paths = self.selected_paths()
-        if paths:
-            self.clip = (paths, cut)
-            self.say(("Вырезано: " if cut else "Скопировано: ") + str(len(paths)))
-
+    def go_entry(self,_entry): self.load(self.path_entry.get_text())
+    def back(self): self.load(self.cwd.parent)
+    def up(self): self.back()
+    def selected(self):
+        model, paths=self.view.get_selection().get_selected_rows()
+        return [Path(model[p][4]) for p in paths]
+    def activate(self,_view,path,_col):
+        p=Path(self.store[path][4])
+        if p.is_dir(): self.load(p)
+        else: Gio.AppInfo.launch_default_for_uri(p.as_uri(),None)
+    def new_folder(self,_b):
+        d=Gtk.Dialog(title="Новая папка",transient_for=self,flags=0)
+        d.add_buttons("Отмена",Gtk.ResponseType.CANCEL,"Создать",Gtk.ResponseType.OK)
+        e=Gtk.Entry(); e.set_text("Новая папка"); d.get_content_area().add(e); d.show_all()
+        if d.run()==Gtk.ResponseType.OK:
+            name=e.get_text().strip()
+            if name and "/" not in name:
+                try: (self.cwd/name).mkdir()
+                except OSError as ex: self.message(str(ex))
+        d.destroy(); self.refresh()
+    def message(self,text):
+        m=Gtk.MessageDialog(transient_for=self,flags=0,message_type=Gtk.MessageType.INFO,buttons=Gtk.ButtonsType.OK,text=text)
+        m.run(); m.destroy()
+    def confirm(self,text):
+        m=Gtk.MessageDialog(transient_for=self,flags=0,message_type=Gtk.MessageType.QUESTION,buttons=Gtk.ButtonsType.YES_NO,text=text)
+        ok=m.run()==Gtk.ResponseType.YES; m.destroy(); return ok
+    def copy(self,cut=False):
+        self.clipboard_paths=self.selected(); self.cut=cut
     def paste(self):
-        paths, cut = self.clip
-        if not paths:
-            self.say("Буфер пуст")
-        elif in_trash(self.cwd):
-            self.say("В корзину удаляют клавишей Delete", True)
-        else:
-            self.run_transfer(paths, self.cwd, cut, clear_clip=cut)
-
-    def run_transfer(self, paths, dest, move, clear_clip=False):
-        self.say("Перемещаю…" if move else "Копирую…")
-
-        def work():
-            done, errs = transfer(paths, dest, move)
-            GLib.idle_add(self.after_transfer, done, move, errs, clear_clip)
-        threading.Thread(target=work, daemon=True).start()
-
-    def after_transfer(self, done, move, errs, clear_clip):
-        if clear_clip:
-            self.clip = ([], False)
-        self.reload()
-        if errs:
-            self.say("Ошибка: " + errs[0] + (f"  (и ещё {len(errs) - 1})" if len(errs) > 1 else ""), True)
-        elif done:
-            self.say(("Перемещено: " if move else "Скопировано: ") + str(done))
-        return False
-
-    def trash(self, force=False):
-        paths = self.selected_paths()
-        if not paths:
-            return
-        perm = force or in_trash(self.cwd)
-        if perm and not self.confirm(f"Удалить навсегда ({len(paths)})?"):
-            return
-        errs = []
+        if not self.clipboard_paths:return
+        for src in self.clipboard_paths:
+            try:
+                if src.parent.resolve()==self.cwd.resolve(): continue
+                if src.is_dir() and self.cwd.resolve().is_relative_to(src.resolve()):
+                    raise OSError("Нельзя копировать папку внутрь самой себя")
+                dst=unique_path(self.cwd,src.name)
+                if self.cut: shutil.move(str(src),str(dst))
+                elif src.is_dir(): shutil.copytree(src,dst)
+                else: shutil.copy2(src,dst)
+            except OSError as e: self.message(str(e))
+        if self.cut:self.clipboard_paths=[]
+        self.refresh()
+    def delete(self,permanent=False):
+        paths=self.selected()
+        if not paths:return
+        if not self.confirm(("Удалить навсегда " if permanent else "Переместить в корзину ") + f"{len(paths)} объект(ов)?"):return
         for p in paths:
             try:
-                if perm:
-                    remove_path(p)
-                    drop_trashinfo(p)
-                else:
-                    Gio.File.new_for_path(p).trash(None)
-            except Exception as e:
-                errs.append(err_text(e))
-        self.reload()
-        if errs:
-            self.say("Ошибка: " + errs[0], True)
-
-    def restore_selected(self):
-        n, errs = 0, []
-        for p in self.selected_paths():
+                if permanent:
+                    shutil.rmtree(p) if p.is_dir() and not p.is_symlink() else p.unlink()
+                else: Gio.File.new_for_path(str(p)).trash(None)
+            except OSError as e:self.message(str(e))
+        self.refresh()
+    def rename(self):
+        paths=self.selected()
+        if len(paths)!=1:return
+        d=Gtk.Dialog(title="Переименовать",transient_for=self,flags=0)
+        d.add_buttons("Отмена",Gtk.ResponseType.CANCEL,"Сохранить",Gtk.ResponseType.OK)
+        e=Gtk.Entry();e.set_text(paths[0].name);d.get_content_area().add(e);d.show_all()
+        if d.run()==Gtk.ResponseType.OK and e.get_text().strip():
             try:
-                restore(p)
-                n += 1
-            except Exception as e:
-                errs.append(err_text(e))
-        self.reload()
-        if errs:
-            self.say("Ошибка: " + errs[0], True)
-        elif n:
-            self.say("Восстановлено: " + str(n))
-
-    def empty_trash_ask(self):
-        if not self.confirm("Очистить корзину насовсем?"):
-            return
-
-        def work():
-            errs = empty_trash()
-            GLib.idle_add(self.after_empty, errs)
-        self.say("Чищу корзину…")
-        threading.Thread(target=work, daemon=True).start()
-
-    def after_empty(self, errs):
-        if self.cwd and in_trash(self.cwd):
-            self.reload()
-        self.say("Ошибка: " + errs[0] if errs else "Корзина пуста", bool(errs))
+                new_name=e.get_text().strip()
+                if new_name in (".", "..") or "/" in new_name or "\\" in new_name:
+                    raise OSError("Недопустимое имя файла")
+                target=paths[0].with_name(new_name)
+                if target.exists() or target.is_symlink():
+                    raise OSError("Файл с таким именем уже существует; он не будет перезаписан")
+                paths[0].rename(target)
+            except (OSError, ValueError) as ex:self.message(str(ex))
+        d.destroy();self.refresh()
+    def bookmark(self):
+        p=str(self.cwd); BOOKMARKS.parent.mkdir(parents=True,exist_ok=True)
+        old=BOOKMARKS.read_text().splitlines() if BOOKMARKS.exists() else []
+        if p not in old: old.append(p)
+        BOOKMARKS.write_text("\n".join(old)+"\n"); self.build_sidebar()
+    def restore_selected(self):
+        for src in self.selected():
+            info=INFO/(src.name+".trashinfo")
+            try:
+                original=None
+                for line in info.read_text(errors="replace").splitlines():
+                    if line.startswith("Path="):
+                        original=Path(unquote(line[5:]))
+                        break
+                if not original or not original.is_absolute(): raise OSError("Не удалось определить исходный путь")
+                original.parent.mkdir(parents=True,exist_ok=True)
+                shutil.move(str(src),str(unique_path(original.parent,original.name)))
+                info.unlink(missing_ok=True)
+            except OSError as e: self.message(str(e))
+        self.refresh()
+    def drag_get(self,_view,_ctx,data,_info,_time):
+        data.set_uris([p.as_uri() for p in self.selected()])
+    def drag_receive(self,view,ctx,x,y,data,_info,_time):
+        dest=self.cwd
+        hit=view.get_dest_row_at_pos(x,y)
+        if hit and self.store[hit[0]][3]: dest=Path(self.store[hit[0]][4])
+        uris=data.get_uris() or []
+        move=ctx.get_selected_action()==Gdk.DragAction.MOVE
+        for uri in uris:
+            src=Gio.File.new_for_uri(uri).get_path()
+            if not src: continue
+            src=Path(src)
+            try:
+                if src.resolve()==dest.resolve() or dest.resolve().is_relative_to(src.resolve()): continue
+                target=unique_path(dest,src.name)
+                if move: shutil.move(str(src),str(target))
+                elif src.is_dir(): shutil.copytree(src,target)
+                else: shutil.copy2(src,target)
+            except (OSError,ValueError) as e: self.message(str(e))
+        ctx.finish(True,False,_time);self.refresh()
+    def properties(self):
+        paths=self.selected() or [self.cwd]
+        lines=[]
+        for p in paths:
+            try:
+                if p.is_dir():
+                    total=0
+                    for root,dirs,files in os.walk(p,followlinks=False):
+                        for name in files:
+                            try: total+=(Path(root)/name).lstat().st_size
+                            except OSError: pass
+                    size="Папка · "+human(total)
+                else: size=human(p.lstat().st_size)
+                lines.append(f"{p.name}: {size}")
+            except OSError as e: lines.append(f"{p}: {e}")
+        self.message("\n".join(lines))
+    def context_menu(self,_view,event):
+        if event.button!=3:return False
+        menu=Gtk.Menu()
+        actions=[("Открыть папку",lambda:self.load(self.selected()[0]) if self.selected() and self.selected()[0].is_dir() else None),
+                 ("Копировать",lambda:self.copy(False)),("Вырезать",lambda:self.copy(True)),
+                 ("Вставить",self.paste),("Переименовать",self.rename),("В корзину",lambda:self.delete(False)),
+                 ("Восстановить из корзины",self.restore_selected),("Удалить навсегда",lambda:self.delete(True)),
+                 ("Свойства / размер",self.properties),("Добавить текущую папку в закладки",self.bookmark)]
+        for label,cb in actions:
+            item=Gtk.MenuItem(label=label);item.connect("activate",lambda _i,f=cb:f());menu.append(item)
+        menu.show_all();menu.popup_at_pointer(event);return True
+    def keypress(self,_w,e):
+        key=Gdk.keyval_name(e.keyval); ctrl=bool(e.state&Gdk.ModifierType.CONTROL_MASK)
+        if key=="Escape": self.destroy();return True
+        if key=="Delete": self.delete(False);return True
+        if key=="F2": self.rename();return True
+        if ctrl and key.lower()=="c":self.copy(False);return True
+        if ctrl and key.lower()=="x":self.copy(True);return True
+        if ctrl and key.lower()=="v":self.paste();return True
+        if ctrl and key.lower()=="l":self.path_entry.grab_focus();return True
+        if ctrl and key.lower()=="d":self.bookmark();return True
         return False
 
-    def start_rename(self):
-        rows = self.selected_rows()
-        if len(rows) != 1 or in_trash(self.cwd):
-            return
-        self.name_r.set_property("editable", True)
-        self.view.set_cursor(rows[0], self.name_col, True)
-
-    def on_edited(self, renderer, path, text):
-        renderer.set_property("editable", False)
-        old = self.store[path][1]
-        text = text.strip()
-        if not text or text == old or "/" in text:
-            return
-        new = os.path.join(self.cwd, text)
-        if os.path.lexists(new) and text.lower() != old.lower():
-            self.say("Уже есть такое имя: " + text, True)
-            return
-        try:
-            os.rename(os.path.join(self.cwd, old), new)
-        except OSError as e:
-            self.say("Ошибка: " + e.strerror, True)
-            return
-        self.reload(select=text)
-
-    def new_folder(self):
-        if in_trash(self.cwd):
-            return
-        path = unique(self.cwd, "Новая папка")
-        try:
-            os.mkdir(path)
-        except OSError as e:
-            self.say("Ошибка: " + e.strerror, True)
-            return
-        self.reload(select=os.path.basename(path))
-        self.start_rename()
-
-    def new_file(self):
-        if in_trash(self.cwd):
-            return
-        path = unique(self.cwd, "Новый файл.txt")
-        try:
-            open(path, "x").close()
-        except OSError as e:
-            self.say("Ошибка: " + e.strerror, True)
-            return
-        self.reload(select=os.path.basename(path))
-        self.start_rename()
-
-    def copy_path(self):
-        text = "\n".join(self.selected_paths() or [self.cwd])
-        try:
-            subprocess.run(["wl-copy"], input=text.encode(), check=True, timeout=3)
-        except Exception:
-            Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(text, -1)
-        self.say("Путь скопирован")
-
-    def open_terminal(self, path=None):
-        path = path if path and os.path.isdir(path) else self.cwd
-        try:
-            subprocess.Popen(["alacritty", "--working-directory", path], start_new_session=True)
-        except OSError as e:
-            self.say("Не запустился alacritty: " + str(e), True)
-
-    def toggle_mark(self, path):
-        path = os.path.realpath(path)
-        if path in self.marks:
-            self.marks.remove(path)
-        else:
-            self.marks.append(path)
-        save_marks(self.marks)
-        self.build_side()
-
-    def select_all(self):
-        self.view.get_selection().select_all()
-
-    def properties(self):
-        paths = self.selected_paths() or [self.cwd]
-        dlg = Gtk.Dialog(title="Свойства", transient_for=self, modal=True)
-        dlg.add_button("Закрыть", Gtk.ResponseType.CLOSE)
-        grid = Gtk.Grid(column_spacing=16, row_spacing=6, margin=16)
-        dlg.get_content_area().add(grid)
-        state = {"row": 0}
-
-        def add(title, text):
-            k = Gtk.Label(label=title, xalign=0)
-            k.get_style_context().add_class("dim")
-            v = Gtk.Label(label=text, xalign=0)
-            v.set_selectable(True)
-            v.set_line_wrap(True)
-            v.set_max_width_chars(48)
-            grid.attach(k, 0, state["row"], 1, 1)
-            grid.attach(v, 1, state["row"], 1, 1)
-            state["row"] += 1
-            return v
-        if len(paths) == 1:
-            p = paths[0]
-            try:
-                st = os.lstat(p)
-            except OSError as e:
-                dlg.destroy()
-                self.say("Ошибка: " + (e.strerror or str(e)), True)
-                return
-            add("Имя", os.path.basename(p) or "/")
-            if stat.S_ISLNK(st.st_mode):
-                kind = "Ссылка → " + os.readlink(p)
-            elif stat.S_ISDIR(st.st_mode):
-                kind = "Папка"
-            else:
-                ctype, _ = Gio.content_type_guess(p, None)
-                kind = Gio.content_type_get_description(ctype) or ctype
-            add("Тип", kind)
-            add("Где", os.path.dirname(p) or "/")
-            add("Изменён", time.strftime("%d.%m.%Y %H:%M:%S", time.localtime(st.st_mtime)))
-            try:
-                owner = pwd.getpwuid(st.st_uid).pw_name
-            except KeyError:
-                owner = str(st.st_uid)
-            add("Права", f"{stat.filemode(st.st_mode)}   {owner}")
-        else:
-            add("Выбрано", f"{len(paths)} объектов")
-        size_lbl = add("Размер", "считаю…")
-        stop = threading.Event()
-        top_dirs = sum(1 for p in paths if is_real_dir(p))
-
-        def work():
-            size, files, dirs = tree_stats(paths, stop)
-            if stop.is_set():
-                return
-            text = human(size)
-            if top_dirs or files > len(paths):
-                text += f"   ·   файлов: {files}, папок: {max(dirs - top_dirs, 0)}"
-            GLib.idle_add(size_lbl.set_text, text)
-        threading.Thread(target=work, daemon=True).start()
-        dlg.show_all()
-        dlg.run()
-        stop.set()
-        dlg.destroy()
-
-    # ---------- мышь и клавиши ----------
-    def on_view_click(self, view, ev):
-        if ev.button == 1 and ev.type == Gdk.EventType.BUTTON_PRESS:
-            # рамка выделения - только с пустого места, иначе строку можно тащить
-            view.set_rubber_banding(view.get_path_at_pos(int(ev.x), int(ev.y)) is None)
-            return False
-        if ev.button != 3:
-            return False
-        hit = view.get_path_at_pos(int(ev.x), int(ev.y))
-        sel = view.get_selection()
-        if hit:
-            if not sel.path_is_selected(hit[0]):
-                sel.unselect_all()
-                sel.select_path(hit[0])
-        else:
-            sel.unselect_all()
-        menu = Gtk.Menu()
-
-        def add(label, cb, enabled=True):
-            it = Gtk.MenuItem(label=label)
-            it.set_sensitive(enabled)
-            it.connect("activate", lambda *_: cb())
-            menu.append(it)
-
-        def sep():
-            menu.append(Gtk.SeparatorMenuItem())
-        rows = self.selected_rows()
-        has, one = bool(rows), len(rows) == 1
-        one_dir = one and self.store[rows[0]][4]
-        one_path = self.store[rows[0]][5] if one else None
-        in_tr = in_trash(self.cwd)
-        if one:
-            add("Открыть", lambda: self.on_row_activated(view, self.selected_rows()[0], None))
-        if one_dir:
-            add("Открыть в терминале", lambda: self.open_terminal(one_path))
-            marked = os.path.realpath(one_path) in self.marks
-            add("Убрать из закладок" if marked else "Добавить в закладки", lambda: self.toggle_mark(one_path))
-        if one:
-            sep()
-        add("Копировать", lambda: self.copy(False), has)
-        add("Вырезать", lambda: self.copy(True), has)
-        add("Вставить", self.paste, bool(self.clip[0]) and not in_tr)
-        sep()
-        if in_tr:
-            add("Восстановить", self.restore_selected, has)
-            add("Удалить навсегда", self.trash, has)
-            add("Очистить корзину", self.empty_trash_ask)
-        else:
-            add("Переименовать", self.start_rename, one)
-            add("В корзину", self.trash, has)
-            add("Удалить навсегда", lambda: self.trash(True), has)
-        sep()
-        add("Копировать путь", self.copy_path)
-        if not in_tr:
-            add("Новая папка", self.new_folder)
-            add("Новый файл", self.new_file)
-        sep()
-        add("Выделить всё", self.select_all)
-        add("Терминал здесь", self.open_terminal)
-        add("Свойства", self.properties)
-        menu.show_all()
-        menu.popup_at_pointer(ev)
-        return True
-
-    def on_key(self, win, ev):
-        key = Gdk.keyval_name(ev.keyval)
-        ctrl = bool(ev.state & Gdk.ModifierType.CONTROL_MASK)
-        shift = bool(ev.state & Gdk.ModifierType.SHIFT_MASK)
-        alt = bool(ev.state & Gdk.ModifierType.MOD1_MASK)
-        typing = isinstance(self.get_focus(), Gtk.Entry)
-        if ctrl and key in ("q", "Q", "w", "W"):
-            self.destroy()
-            return True
-        if ctrl and key in ("l", "L"):
-            self.entry.grab_focus()
-            return True
-        if key == "Escape" and typing:
-            self.view.grab_focus()
-            return True
-        if typing:
-            return False
-        if alt and key == "Left":
-            self.go_back()
-        elif alt and key == "Right":
-            self.go_forward()
-        elif alt and key in ("Return", "KP_Enter"):
-            self.properties()
-        elif (alt and key == "Up") or key == "BackSpace":
-            self.go_up()
-        elif key == "F5":
-            self.reload()
-        elif key == "F2":
-            self.start_rename()
-        elif key == "F4":
-            self.open_terminal()
-        elif key == "Delete":
-            self.trash(shift)
-        elif ctrl and shift and key in ("n", "N"):
-            self.new_folder()
-        elif ctrl and key in ("a", "A"):
-            self.select_all()
-        elif ctrl and key in ("d", "D"):
-            self.toggle_mark(self.cwd)
-        elif ctrl and key in ("c", "C"):
-            self.copy(False)
-        elif ctrl and key in ("x", "X"):
-            self.copy(True)
-        elif ctrl and key in ("v", "V"):
-            self.paste()
-        elif ctrl and key in ("h", "H"):
-            self.b_hidden.set_active(not self.b_hidden.get_active())
-        else:
-            return False
-        return True
-
-
 def main():
-    GLib.set_prgname("files")
-    GLib.set_application_name("Files")
-    start, select = HOME, None
-    if len(sys.argv) > 1:
-        p = os.path.abspath(os.path.expanduser(sys.argv[1]))
-        if os.path.isdir(p):
-            start = p
-        elif os.path.exists(p):
-            start, select = os.path.dirname(p), os.path.basename(p)
-    win = FilesWindow(start, select)
-    win.connect("destroy", Gtk.main_quit)
-    win.show_all()
-    Gtk.main()
+    css(); start=sys.argv[1] if len(sys.argv)>1 and Path(sys.argv[1]).is_dir() else str(HOME)
+    w=FilesWindow(start);w.connect("destroy",Gtk.main_quit);w.show_all();Gtk.main()
+if __name__=="__main__": main()
+FILES_PY
+write_file "$BIN_ROOT/files" 0755 <<'FILES_LAUNCH'
+#!/usr/bin/env bash
+exec /usr/bin/python /usr/local/lib/hypr-minimal/files.py "$@"
+FILES_LAUNCH
 
-
-if __name__ == "__main__":
-    main()
-EOF
-chmod 755 /usr/local/bin/files
-
-# ---------- меню питания ----------
-cat > /usr/local/bin/power-menu <<'EOF'
-#!/usr/bin/python3
-import os
-import re
-import subprocess
+# Графические меню: GTK3, без постоянно работающего демона.
+write_file "$LIB_ROOT/menu.py" 0644 <<'MENU_PY'
+#!/usr/bin/env python3
+import os, subprocess
 import gi
-gi.require_version("Gtk", "3.0")
-gi.require_version("Gdk", "3.0")
-from gi.repository import Gdk, GLib, Gtk
-
-LOCK = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "power-menu.pid")
-CSS = b"""
-* { font-family: "DejaVu Sans Mono", "FontAwesome", monospace; }
-window { background-color: rgba(5,8,14,0.60); }
-.card { background-color: rgba(13,17,27,0.85); border: 1px solid rgba(137,180,250,0.45);
-border-radius: 20px; padding: 22px 24px 14px 24px; }
-button { background-image: none; background-color: rgba(137,180,250,0.06); color: #cdd6f4;
-border: 1px solid rgba(137,180,250,0.25); border-radius: 16px; box-shadow: none; padding: 0; }
-button:hover, button:focus { background-color: rgba(137,180,250,0.18); border-color: #89b4fa; }
-button.danger { color: #f38ba8; border-color: rgba(243,139,168,0.45); }
-button.danger:hover, button.danger:focus { background-color: rgba(243,139,168,0.20); border-color: #f38ba8; }
-.icon { font-size: 30px; }
-.name { font-size: 11px; }
-.key { color: #7f8fae; font-size: 9px; }
-.hint { color: #6b7a96; font-size: 9px; }
+gi.require_version("Gtk","3.0")
+from gi.repository import Gtk,Gdk,GLib
+BG="#111512"; PANEL="#1a211b"; ACCENT="#71834b"; TEXT="#e1e7df"; MUTED="#a0aa9d"
+CSS=f"""
+window {{ background: rgba(5,8,6,0.82); color:{TEXT}; }}
+.panel {{ background: #1a211b; border: 1px solid #526447; border-radius: 16px; padding: 10px; }}
+button {{ background:{PANEL}; color:{TEXT}; border:1px solid #3b4938; border-radius:10px; padding:12px 20px; }}
+button:hover, button:focus {{ background:#35452f; border:1px solid {ACCENT}; }}
+label {{ color:{TEXT}; }}
+.dim {{ color:{MUTED}; }}
 """
-
-ITEMS = (
-    ("\uf011", "Выключить", "P", "poweroff", True),
-    ("\uf021", "Перезагрузить", "R", "reboot", False),
-    ("\uf186", "Сон", "S", "suspend", False),
-    ("\uf08b", "Выйти", "E", "exit", False),
-)
-
-
-def running():
-    try:
-        with open(LOCK) as f:
-            pid = int(f.read().strip())
-        with open(f"/proc/{pid}/cmdline", "rb") as f:
-            return pid if b"power-menu" in f.read() else 0
-    except Exception:
-        return 0
-
-
-def drop_lock():
-    try:
-        os.remove(LOCK)
-    except OSError:
-        pass
-
-
-def logout():
-    # сначала обычная команда Hyprland, потом вариант для Lua-конфига, в конце - через logind
-    for args in (["hyprctl", "dispatch", "exit"], ["hyprctl", "dispatch", "hl.dsp.exit()"]):
-        try:
-            r = subprocess.run(args, capture_output=True, text=True, timeout=3)
-            if r.returncode == 0 and r.stdout.strip().lower().startswith("ok"):
-                return
-        except Exception:
-            pass
-    sid = os.environ.get("XDG_SESSION_ID")
-    try:
-        if sid:
-            subprocess.Popen(["loginctl", "terminate-session", sid], start_new_session=True)
-        else:
-            subprocess.Popen(["loginctl", "terminate-user", os.environ.get("USER", "")], start_new_session=True)
-    except Exception:
-        pass
-
-
-class PowerMenu(Gtk.Window):
-    def __init__(self):
-        super().__init__(title="power-menu")
-        self.set_decorated(False)
-        screen = self.get_screen()
-        visual = screen.get_rgba_visual()
-        if visual:
-            self.set_visual(visual)
-        for rule in re.findall(rb"[^{}]+\{[^{}]*\}", CSS):
-            prov = Gtk.CssProvider()
-            try:
-                prov.load_from_data(rule)
-            except GLib.Error:
-                continue
-            Gtk.StyleContext.add_provider_for_screen(screen, prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
-        bg = Gtk.EventBox()
-        bg.set_visible_window(False)
-        bg.connect("button-press-event", lambda w, e: self.quit())
-        hold = Gtk.EventBox()
-        hold.set_visible_window(False)
-        hold.set_halign(Gtk.Align.CENTER)
-        hold.set_valign(Gtk.Align.CENTER)
-        hold.connect("button-press-event", lambda w, e: True)
-        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
-        card.get_style_context().add_class("card")
-        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        self.buttons = []
-        self.keys = {}
-        for icon, name, key, cmd, danger in ITEMS:
-            b = Gtk.Button()
-            b.set_size_request(132, 112)
-            if danger:
-                b.get_style_context().add_class("danger")
-            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-            col.set_valign(Gtk.Align.CENTER)
-            for text, cls in ((icon, "icon"), (name, "name"), (key, "key")):
-                lab = Gtk.Label(label=text)
-                lab.get_style_context().add_class(cls)
-                col.pack_start(lab, False, False, 0)
-            b.add(col)
-            b.connect("clicked", lambda w, c=cmd: self.run(c))
-            row.pack_start(b, False, False, 0)
-            self.buttons.append(b)
-            self.keys[key.lower()] = cmd
-        hint = Gtk.Label(label="← →  выбор    Enter  подтвердить    Esc  закрыть")
-        hint.get_style_context().add_class("hint")
-        card.pack_start(row, False, False, 0)
-        card.pack_start(hint, False, False, 0)
-        hold.add(card)
-        bg.add(hold)
-        self.add(bg)
-        self.connect("key-press-event", self.on_key)
-        self.fullscreen()
-
-    def focus_step(self, d):
-        cur = self.get_focus()
-        i = self.buttons.index(cur) if cur in self.buttons else -1
-        self.buttons[(i + d) % len(self.buttons)].grab_focus()
-
-    def on_key(self, w, ev):
-        k = Gdk.keyval_name(ev.keyval) or ""
-        if k == "Escape":
-            self.quit()
-        elif k in ("Left", "Up", "ISO_Left_Tab"):
-            self.focus_step(-1)
-        elif k in ("Right", "Down", "Tab"):
-            self.focus_step(1)
-        elif k.lower() in self.keys:
-            self.run(self.keys[k.lower()])
-        else:
-            return False
-        return True
-
-    def run(self, cmd):
-        self.hide()
-        if cmd == "exit":
-            logout()
-        else:
-            subprocess.Popen(["systemctl", cmd], start_new_session=True)
-        self.quit()
-
-    def quit(self):
-        self.destroy()
-
-
-def on_destroy(*_):
-    drop_lock()
-    Gtk.main_quit()
-
-
+def apply_css():
+ p=Gtk.CssProvider();p.load_from_data(CSS.encode());Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(),p,Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+def command(args):
+ try:return subprocess.run(args,check=False).returncode==0
+ except OSError:return False
+class Menu(Gtk.Window):
+ def __init__(self,kind):
+  super().__init__(title="Power Menu" if kind=="power" else "Профиль питания")
+  self.kind=kind;self.set_decorated(False);self.set_modal(True);self.set_position(Gtk.WindowPosition.CENTER)
+  visual=self.get_screen().get_rgba_visual()
+  if visual:self.set_visual(visual)
+  self.fullscreen();self.connect("key-press-event",self.key)
+  outer=Gtk.Box(orientation=Gtk.Orientation.VERTICAL);outer.set_halign(Gtk.Align.CENTER);outer.set_valign(Gtk.Align.CENTER)
+  self.add(outer)
+  box=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=10);box.set_margin_top(24);box.set_margin_bottom(24);box.set_margin_start(28);box.set_margin_end(28);box.set_size_request(430,-1);box.get_style_context().add_class("panel");outer.pack_start(box,False,False,0)
+  title=Gtk.Label();title.set_markup("<span size='x-large' weight='bold'>"+("Питание" if kind=="power" else "Режим производительности")+"</span>")
+  box.pack_start(title,False,False,4)
+  if kind=="power":
+   opts=[("Выключение","systemctl poweroff"),("Перезагрузка","systemctl reboot"),("Сон","systemctl suspend"),("Выход из Hyprland","hyprctl dispatch hl.dsp.exit()")]
+   for label,cmd in opts:
+    b=Gtk.Button(label=label);b.connect("clicked",lambda _b,c=cmd:self.act(c));box.pack_start(b,True,True,0)
+  else:
+   current_run=subprocess.run(["powerprofilesctl","get"],capture_output=True,text=True)
+   listed_run=subprocess.run(["powerprofilesctl","list"],capture_output=True,text=True)
+   current=current_run.stdout.strip()
+   listed=listed_run.stdout if listed_run.returncode==0 else ""
+   if listed_run.returncode!=0:
+    box.pack_start(Gtk.Label(label="Служба профилей питания недоступна. Проверь power-profiles-daemon и конфликтующие службы.",wrap=True),False,False,6)
+   supported=[p for p in ("performance","balanced","power-saver") if p in listed]
+   box.pack_start(Gtk.Label(label="Активный профиль: "+(current or "не определён")),False,False,2)
+   desc={"performance":"Производительность: повышенная штатная отзывчивость; нагрев и шум могут вырасти.",
+         "balanced":"Сбалансированный: повседневная работа и умеренное энергопотребление.",
+         "power-saver":"Энергосбережение: ниже энергопотребление; под нагрузкой система может быть медленнее."}
+   labels={"performance":"Производительность","balanced":"Сбалансированный","power-saver":"Энергосбережение"}
+   for profile in supported:
+    b=Gtk.Button(label=labels[profile]+("  ✓" if profile==current else ""));b.set_tooltip_text(desc[profile])
+    b.connect("clicked",lambda _b,p=profile:self.set_profile(p));box.pack_start(b,True,True,0)
+    info=Gtk.Label(label=desc[profile],wrap=True,xalign=0);info.get_style_context().add_class("dim");box.pack_start(info,False,False,0)
+   missing=[p for p in ("performance","balanced","power-saver") if p not in supported]
+   if missing:
+    box.pack_start(Gtk.Label(label="Не поддерживаются этим оборудованием/драйвером: "+", ".join(missing),wrap=True),False,False,4)
+   box.pack_start(Gtk.Label(label="Используется power-profiles-daemon. Недоступные аппаратные функции не имитируются.",wrap=True),False,False,4)
+  cancel=Gtk.Button(label="Закрыть");cancel.connect("clicked",lambda *_:self.destroy());box.pack_start(cancel,False,False,4)
+ def key(self,_w,e):
+  if Gdk.keyval_name(e.keyval)=="Escape":self.destroy();return True
+  return False
+ def act(self,cmd):
+  self.destroy();command(cmd.split())
+ def set_profile(self,p):
+  if command(["powerprofilesctl","set",p]):
+   state=os.path.expanduser("~/.local/state/hypr-minimal");os.makedirs(state,exist_ok=True)
+   with open(state+"/power-profile","w") as f:f.write(p+"\n")
+   self.destroy()
+  else:
+   d=Gtk.MessageDialog(transient_for=self,flags=0,message_type=Gtk.MessageType.ERROR,buttons=Gtk.ButtonsType.OK,text="Не удалось переключить профиль питания")
+   d.format_secondary_text("Профиль не поддерживается или служба power-profiles-daemon недоступна.");d.run();d.destroy()
 def main():
-    GLib.set_prgname("power-menu")
-    GLib.set_application_name("power-menu")
-    pid = running()
-    if pid:
-        try:
-            os.kill(pid, 15)
-        except OSError:
-            pass
-        drop_lock()
-        return
-    w = PowerMenu()
-    w.connect("destroy", on_destroy)
-    w.show_all()
-    try:
-        with open(LOCK, "w") as f:
-            f.write(str(os.getpid()))
-    except OSError:
-        pass
-    w.buttons[0].grab_focus()
-    Gtk.main()
+ import sys
+ apply_css();w=Menu(sys.argv[1] if len(sys.argv)>1 else "power");w.show_all();Gtk.main()
+if __name__=="__main__":main()
+MENU_PY
+write_file "$BIN_ROOT/power-menu" 0755 <<'POWER_LAUNCH'
+#!/usr/bin/env bash
+exec /usr/bin/python /usr/local/lib/hypr-minimal/menu.py power
+POWER_LAUNCH
+write_file "$BIN_ROOT/performance-menu" 0755 <<'PERF_LAUNCH'
+#!/usr/bin/env bash
+exec /usr/bin/python /usr/local/lib/hypr-minimal/menu.py performance
+PERF_LAUNCH
 
+write_file "$BIN_ROOT/hypr-wallpaper-next" 0755 <<'WALL'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+dir="$HOME/Pictures/wall"
+mkdir -p "$dir"
+mapfile -d '' imgs < <(find "$dir" -maxdepth 1 -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.webp' \) -print0 | sort -z)
+((${#imgs[@]})) || { notify-send "Обои" "Добавь изображения в ~/Pictures/wall"; exit 0; }
+state="${XDG_STATE_HOME:-$HOME/.local/state}/hypr-minimal/wall-index"
+mkdir -p "$(dirname "$state")"
+i=-1
+if [[ -r "$state" ]]; then read -r i < "$state" || i=-1; fi
+[[ "$i" =~ ^-?[0-9]+$ ]] || i=-1
+if (( i < -1 || i >= ${#imgs[@]} )); then i=-1; fi
+i=$(( (i+1) % ${#imgs[@]} ))
+printf '%s\n' "$i" > "$state"
+pkill -x swaybg 2>/dev/null || true
+exec swaybg -i "${imgs[$i]}" -m fill
+WALL
 
-if __name__ == "__main__":
-    main()
-EOF
-chmod 755 /usr/local/bin/power-menu
+write_file "$BIN_ROOT/hypr-restore-profile" 0755 <<'RESTORE'
+#!/usr/bin/env bash
+set -u
+state="${XDG_STATE_HOME:-$HOME/.local/state}/hypr-minimal/power-profile"
+[[ -r "$state" ]] || exit 0
+read -r profile < "$state"
+case "$profile" in performance|balanced|power-saver) powerprofilesctl set "$profile" || true ;; esac
+RESTORE
 
-# ================= конфиги пользователя =================
-# w ФАЙЛ - записать stdin в файл (старую версию один раз сохраняет в .bak)
-w() {
-  mkdir -p "$(dirname "$1")"
-  if [ -f "$1" ] && [ ! -f "$1.bak" ]; then cp -p "$1" "$1.bak"; fi
-  cat > "$1"
-}
-rm -f "$H/.config/hypr/quick-kill.sh"
-[ ! -f "$H/.config/hypr/hyprland.conf" ] || mv "$H/.config/hypr/hyprland.conf" "$H/.config/hypr/hyprland.conf.old"
+# Запускаем compositor с AQ_DRM_DEVICES до инициализации Aquamarine.
+write_file "$BIN_ROOT/start-hyprland-intel" 0755 <<START_INTEL
+#!/usr/bin/env bash
+set -Eeuo pipefail
+export AQ_DRM_DEVICES="$INTEL_DRM_CARD"
+unset __NV_PRIME_RENDER_OFFLOAD __NV_PRIME_RENDER_OFFLOAD_PROVIDER __VK_LAYER_NV_optimus
+export DRI_PRIME=pci-0000_00_02_0!
+export __GLX_VENDOR_LIBRARY_NAME=mesa
+export LIBVA_DRIVER_NAME=iHD
+export VK_LOADER_DRIVERS_SELECT="*intel_icd*"
+exec /usr/bin/start-hyprland "\$@"
+START_INTEL
 
-# ---------- Hyprland ----------
-w "$H/.config/hypr/hyprland.lua" <<'EOF'
-local mod = "SUPER"
-
+# Цветовая тема и конфигурация Hyprland.
+mkdir -p "$CONFIG_ROOT/hypr" "$CONFIG_ROOT/waybar" "$CONFIG_ROOT/wofi" "$CONFIG_ROOT/gtk-3.0" "$STATE_ROOT" "$TARGET_HOME/Pictures/wall"
+write_file "$CONFIG_ROOT/hypr/hyprland.lua" 0644 <<HYPRLUA
+-- Hyprland 0.57+: конфигурация на Lua (старый hyprland.conf больше не используется).
 hl.monitor({ output = "", mode = "preferred", position = "auto", scale = "auto" })
 
-hl.on("hyprland.start", function()
-  hl.exec_cmd("dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP")
-  hl.exec_cmd("sh ~/.config/hypr/wallpaper.sh")
-  hl.exec_cmd("waybar")
-  hl.exec_cmd("lxqt-policykit-agent")
-end)
+hl.env("XCURSOR_SIZE", "24")
+hl.env("HYPRCURSOR_SIZE", "24")
+hl.env("GTK_THEME", "Adwaita-dark")
+hl.env("QT_QPA_PLATFORMTHEME", "qt6ct")
+hl.env("QT_STYLE_OVERRIDE", "Fusion")
+hl.env("DRI_PRIME", "pci-0000_00_02_0!")
+hl.env("__GLX_VENDOR_LIBRARY_NAME", "mesa")
+hl.env("LIBVA_DRIVER_NAME", "iHD")
+hl.env("__NV_PRIME_RENDER_OFFLOAD", "0")
+hl.env("__VK_LAYER_NV_optimus", "")
+hl.env("VK_LOADER_DRIVERS_SELECT", "*intel_icd*")
+hl.env("XDG_CURRENT_DESKTOP", "Hyprland")
+hl.env("XDG_SESSION_TYPE", "wayland")
+hl.env("XDG_SESSION_DESKTOP", "Hyprland")
 
 hl.config({
-  input = {
-    kb_layout = "us,ru",
-    kb_options = "grp:alt_shift_toggle",
-    follow_mouse = 1,
-    repeat_rate = 40,
-    repeat_delay = 250,
-    touchpad = { natural_scroll = true },
-  },
-  general = {
-    gaps_in = 6,       -- между окнами
-    gaps_out = 14,     -- от краёв экрана до окон
-    border_size = 1,
-    col = {
-      active_border = "rgba(89b4faee)",
-      inactive_border = "rgba(3a4a66aa)",
+    general = {
+        gaps_in = 4,
+        gaps_out = 8,
+        border_size = 1,
+        col = {
+            active_border = "rgba(71834bff)",
+            inactive_border = "rgba(343d35cc)",
+        },
+        layout = "dwindle",
+        allow_tearing = false,
     },
-    layout = "dwindle",
-  },
-  dwindle = {
-    preserve_split = true,  -- раскладка не «прыгает» при закрытии окон
-    force_split = 2,        -- новое окно встаёт справа/снизу, экран делится пополам
-  },
-  decoration = {
-    rounding = 8,
-    active_opacity = 1.0,
-    inactive_opacity = 0.95,
-    blur = { enabled = true, size = 6, passes = 3 },
-  },
-  animations = { enabled = true },
-  misc = {
-    disable_hyprland_logo = true,
-    disable_splash_rendering = true,
-    on_focus_under_fullscreen = 2,  -- новое окно не прячется за полноэкранным
-  },
+    input = {
+        kb_layout = "us,ru",
+        kb_options = "grp:alt_shift_toggle",
+        follow_mouse = 1,
+        repeat_rate = 35,
+        repeat_delay = 275,
+        touchpad = { natural_scroll = true },
+    },
+    decoration = {
+        rounding = 7,
+        active_opacity = 1.0,
+        inactive_opacity = 1.0,
+        blur = { enabled = false },
+        shadow = { enabled = false },
+    },
+    animations = { enabled = false },
+    dwindle = { preserve_split = true },
+    misc = {
+        disable_hyprland_logo = true,
+    },
 })
 
-hl.curve("ease", { type = "bezier", points = { {0.22, 1}, {0.36, 1} } })
-hl.animation({ leaf = "windows",    enabled = true, speed = 5, bezier = "ease", style = "slide" })
-hl.animation({ leaf = "fade",       enabled = true, speed = 5, bezier = "ease" })
-hl.animation({ leaf = "workspaces", enabled = true, speed = 5, bezier = "ease", style = "slide" })
-
-hl.bind(mod .. " + Return", hl.dsp.exec_cmd("alacritty -e sh ~/.config/fastfetch/show.sh"))
-hl.bind(mod .. " + D", hl.dsp.exec_cmd("/usr/local/bin/launcher.sh"))
-hl.bind(mod .. " + B", hl.dsp.exec_cmd("firefox"))
-hl.bind(mod .. " + E", hl.dsp.exec_cmd("/usr/local/bin/files"))
-hl.bind(mod .. " + W", hl.dsp.exec_cmd("sh ~/.config/hypr/wallpaper.sh next"))
-hl.bind(mod .. " + Q", hl.dsp.window.close())
-hl.bind(mod .. " + SHIFT + Q", hl.dsp.window.close(), { repeating = true })
-hl.bind(mod .. " + SHIFT + Escape", hl.dsp.exec_cmd("/usr/local/bin/power-menu"))
-hl.bind(mod .. " + F", hl.dsp.window.fullscreen({ mode = "fullscreen", action = "toggle" }))
-hl.bind(mod .. " + V", hl.dsp.window.float({ action = "toggle" }))
-
-for _, d in ipairs({ "left", "right", "up", "down" }) do
-  hl.bind(mod .. " + " .. d, hl.dsp.focus({ direction = d }))
-  hl.bind(mod .. " + SHIFT + " .. d, hl.dsp.window.move({ direction = d }))
+local function bind(key, command)
+    hl.bind(key, hl.dsp.exec_cmd(command))
 end
 
-hl.bind(mod .. " + CTRL + left",  hl.dsp.window.resize({ x = -40, y = 0,  relative = true }), { repeating = true })
-hl.bind(mod .. " + CTRL + right", hl.dsp.window.resize({ x = 40,  y = 0,  relative = true }), { repeating = true })
-hl.bind(mod .. " + CTRL + up",    hl.dsp.window.resize({ x = 0,   y = -40, relative = true }), { repeating = true })
-hl.bind(mod .. " + CTRL + down",  hl.dsp.window.resize({ x = 0,   y = 40,  relative = true }), { repeating = true })
+-- Автозапуск лёгких компонентов.
+hl.on("hyprland.start", function()
+    hl.exec_cmd("dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE DRI_PRIME VK_LOADER_DRIVERS_SELECT __GLX_VENDOR_LIBRARY_NAME LIBVA_DRIVER_NAME")
+    hl.exec_cmd("waybar")
+    hl.exec_cmd("mako")
+    hl.exec_cmd("/usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1")
+    hl.exec_cmd("/usr/local/bin/hypr-restore-profile")
+    hl.exec_cmd("/usr/local/bin/hypr-wallpaper-next")
+end)
 
-hl.bind(mod .. " + mouse:272", hl.dsp.window.drag(), { mouse = true })
-hl.bind(mod .. " + mouse:273", hl.dsp.window.resize(), { mouse = true })
+bind("SUPER + RETURN", "alacritty -e bash -lc 'fastfetch; exec bash'")
+bind("SUPER + D", "/usr/local/bin/hypr-launcher")
+bind("SUPER + E", "files")
+bind("SUPER + B", "firefox")
+bind("SUPER + W", "hypr-wallpaper-next")
+hl.bind("SUPER + Q", hl.dsp.window.close())
+hl.bind("SUPER + F", hl.dsp.window.fullscreen({ mode = "fullscreen", action = "toggle" }))
+hl.bind("SUPER + V", hl.dsp.window.float({ action = "toggle" }))
+bind("SUPER + SHIFT + ESCAPE", "power-menu")
+bind("SUPER + SHIFT + P", "performance-menu")
+
+bind("XF86AudioRaiseVolume", "wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 5%+")
+bind("XF86AudioLowerVolume", "wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-")
+bind("XF86AudioMute", "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle")
+bind("XF86AudioMicMute", "wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle")
+-- Fn+F6/F7/F8: мультимедийные клавиши ноутбука через MPRIS/playerctl.
+-- Fn обычно обрабатывается прошивкой и отправляет XF86Audio* без отдельного модификатора.
+bind("XF86AudioPrev", "playerctl previous")
+bind("XF86AudioPlay", "playerctl play-pause")
+bind("XF86AudioNext", "playerctl next")
+bind("XF86MonBrightnessUp", "brightnessctl set +5%")
+bind("XF86MonBrightnessDown", "brightnessctl set 5%-")
+
+bind("SUPER + SHIFT + S", 'grim -g "\$(slurp)" "\$HOME/Pictures/screenshot-\$(date +%F-%H%M%S).png"')
+bind("SUPER + CTRL + C", 'grim -g "\$(slurp)" - | wl-copy')
 
 for i = 1, 5 do
-  hl.bind(mod .. " + " .. i, hl.dsp.focus({ workspace = i }))
-  hl.bind(mod .. " + SHIFT + " .. i, hl.dsp.window.move({ workspace = i }))
+    hl.bind("SUPER + " .. i, hl.dsp.focus({ workspace = tostring(i) }))
+    hl.bind("SUPER + SHIFT + " .. i, hl.dsp.window.move({ workspace = tostring(i) }))
 end
+HYPRLUA
+write_file "$BIN_ROOT/hypr-launcher" 0755 <<'LAUNCHER'
+#!/usr/bin/env bash
+set -e
+if pgrep -u "$UID" -x wofi >/dev/null 2>&1; then pkill -u "$UID" -x wofi; exit 0; fi
+exec wofi --show drun --allow-images
+LAUNCHER
 
-hl.bind(mod .. " + Tab", hl.dsp.focus({ workspace = "e+1" }))
-hl.bind(mod .. " + mouse_down", hl.dsp.focus({ workspace = "e+1" }))
-hl.bind(mod .. " + mouse_up", hl.dsp.focus({ workspace = "e-1" }))
-hl.bind(mod .. " + Space", hl.dsp.exec_cmd("hyprctl switchxkblayout all next"))
-hl.bind(mod .. " + SHIFT + S", hl.dsp.exec_cmd('grim -g "$(slurp)" - | wl-copy'))
-
-hl.bind("XF86AudioRaiseVolume", hl.dsp.exec_cmd("wpctl set-volume -l 1 @DEFAULT_AUDIO_SINK@ 5%+"), { locked = true, repeating = true })
-hl.bind("XF86AudioLowerVolume", hl.dsp.exec_cmd("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-"), { locked = true, repeating = true })
-hl.bind("XF86AudioMute", hl.dsp.exec_cmd("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle"), { locked = true })
-hl.bind("XF86MonBrightnessUp", hl.dsp.exec_cmd("brightnessctl set 5%+"), { locked = true, repeating = true })
-hl.bind("XF86MonBrightnessDown", hl.dsp.exec_cmd("brightnessctl set 5%-"), { locked = true, repeating = true })
-
-hl.window_rule({ name = "float-wofi", match = { class = "^(wofi)$" }, float = true })
-hl.window_rule({ name = "float-power-menu", match = { class = "^(power-menu)$" }, float = true })
-EOF
-
-# ---------- alacritty ----------
-w "$H/.config/alacritty/alacritty.toml" <<'EOF'
+write_file "$CONFIG_ROOT/waybar/config.jsonc" 0644 <<'WAYBAR'
+{
+  "layer": "top",
+  "position": "top",
+  "height": 28,
+  "spacing": 4,
+  "modules-left": ["custom/launcher", "custom/files", "custom/terminal", "hyprland/workspaces"],
+  "modules-center": ["clock"],
+  "modules-right": ["hyprland/language", "pulseaudio", "backlight", "battery", "tray", "custom/performance", "custom/power"],
+  "custom/launcher": {"format":"◈","tooltip":"Приложения","on-click":"/usr/local/bin/hypr-launcher"},
+  "custom/files": {"format":"▣","tooltip":"Files","on-click":"files"},
+  "custom/terminal": {"format":"⌘","tooltip":"Alacritty","on-click":"alacritty"},
+  "hyprland/workspaces": {"format":"{name}","on-click":"activate","all-outputs":true,"disable-scroll":true},
+  "clock": {"format":"  {:%a %d %b  %H:%M}","tooltip":false},
+  "hyprland/language": {"format":"{short}","tooltip":true},
+  "pulseaudio": {"format":" {volume}% {format_source}","format-muted":" muted {format_source}","format-source":" {volume}%","format-source-muted":" muted","on-click":"wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle","on-click-right":"wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle","on-scroll-up":"wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 5%+","on-scroll-down":"wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-"},
+  "backlight": {"format":"☼ {percent}%"},
+  "battery": {"format":"{icon} {capacity}%","format-icons":["󰂎","󰁺","󰁻","󰁼","󰁽","󰁾","󰁿","󰂀","󰂁","󰂂","󰁹"],"states":{"warning":25,"critical":10}},
+  "tray": {"spacing":6},
+  "custom/performance": {"format":"⚙","tooltip":"Профиль питания","on-click":"/usr/local/bin/performance-menu"},
+  "custom/power": {"format":"⏻","tooltip":"Power Menu","on-click":"/usr/local/bin/power-menu"}
+}
+WAYBAR
+write_file "$CONFIG_ROOT/waybar/style.css" 0644 <<'WAYCSS'
+* { font-family: "JetBrainsMono Nerd Font", "Noto Color Emoji", sans-serif; font-size: 11px; border: none; min-height: 0; }
+window#waybar { background: rgba(17,21,18,0.96); color: #e1e7df; border-bottom: 1px solid #394536; }
+#clock { color: #d7dfcf; font-weight: 600; }
+#workspaces button { color: #a0aa9d; background: transparent; padding: 0 7px; margin: 3px 1px; border-radius: 5px; }
+#workspaces button.active { color: #f0f4e9; background: #46583b; }
+#workspaces button:hover, #custom-launcher:hover, #custom-files:hover, #custom-terminal:hover,
+#custom-performance:hover, #custom-power:hover { background: #35452f; color: #f0f4e9; }
+#custom-launcher, #custom-files, #custom-terminal, #custom-performance, #custom-power,
+#pulseaudio, #backlight, #battery, #language, #tray { padding: 0 7px; }
+#custom-launcher, #custom-performance { color: #a9bb7a; }
+#custom-power { color: #c4a58b; padding-right: 12px; }
+#battery.warning { color: #d8b76c; }
+#battery.critical { color: #d98b7d; }
+tooltip { background: #171e18; border: 1px solid #526447; color: #e1e7df; }
+WAYCSS
+write_file "$CONFIG_ROOT/wofi/config" 0644 <<'WOFI'
+width=540
+height=360
+location=center
+show=drun
+prompt=Поиск приложений
+allow_images=true
+image_size=24
+insensitive=true
+hide_scroll=true
+WOFI
+write_file "$CONFIG_ROOT/wofi/style.css" 0644 <<'WOFICSS'
+window { background: #111512; color: #e1e7df; border: 1px solid #526447; border-radius: 10px; font-family: "DejaVu Sans"; }
+#input { background: #1a211b; color: #e1e7df; border: 1px solid #526447; border-radius: 7px; margin: 8px; padding: 8px; }
+#entry { padding: 7px; }
+#entry:selected { background: #405238; color: #fff; border-radius: 6px; }
+#text { color: #e1e7df; }
+WOFICSS
+write_file "$CONFIG_ROOT/alacritty/alacritty.toml" 0644 <<'ALACRITTY'
 [window]
-decorations = "none"
 opacity = 1.0
-
-[colors.primary]
-background = "#181a26"
-foreground = "#c0caf5"
+padding = { x = 10, y = 8 }
+decorations = "Full"
 
 [font]
-size = 11.0
-EOF
+size = 10.5
+normal = { family = "DejaVu Sans Mono" }
 
-# ---------- cava (запуск только из терминала: cava) ----------
-w "$H/.config/cava/config" <<'EOF'
-[general]
-bar_width = 2
-bar_spacing = 1
+[colors.primary]
+background = "#111512"
+foreground = "#e1e7df"
 
-[color]
-gradient = 1
-gradient_count = 4
-gradient_color_1 = '#1e3354'
-gradient_color_2 = '#3f6aa8'
-gradient_color_3 = '#89b4fa'
-gradient_color_4 = '#a6e3f5'
-EOF
+[colors.normal]
+black = "#171e18"
+red = "#bd766b"
+green = "#879b60"
+yellow = "#b7a36a"
+blue = "#778b72"
+magenta = "#9a829a"
+cyan = "#78978f"
+white = "#d2d9ce"
 
-# ---------- waybar: одна тонкая полоса сверху ----------
-w "$H/.config/waybar/config.jsonc" <<'EOF'
-{
-  "layer": "top", "height": 26, "spacing": 2,
-  "margin-top": 8, "margin-left": 14, "margin-right": 14,
-  "modules-left": ["custom/launcher", "custom/files", "custom/term", "hyprland/workspaces"],
-  "modules-center": ["clock"],
-  "modules-right": ["tray", "hyprland/language", "pulseaudio", "pulseaudio#mic", "backlight", "battery", "custom/power"],
-  "custom/launcher": { "format": "\uf002", "tooltip": false, "on-click": "/usr/local/bin/launcher.sh" },
-  "custom/files":    { "format": "\uf07b", "tooltip": false, "on-click": "/usr/local/bin/files" },
-  "custom/term":     { "format": "\uf120", "tooltip": false, "on-click": "alacritty" },
-  "custom/power":    { "format": "\uf011", "tooltip": false, "on-click": "/usr/local/bin/power-menu" },
-  "hyprland/workspaces": { "format": "{id}", "persistent-workspaces": { "*": 5 } },
-  "hyprland/language": { "format": "{short}" },
-  "tray": { "icon-size": 14, "spacing": 6 },
-  "clock": { "format": "{:%H:%M}", "tooltip-format": "{:%A, %d %B %Y}" },
-  },
-  "pulseaudio": {
-    "format": "\uf028 {volume}%",
-    "format-muted": "\uf6a9",
-    "on-click": "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle"
-  },
-  "pulseaudio#mic": {
-    "format": "{format_source}",
-    "format-source": "\uf130",
-    "format-source-muted": "\uf131",
-    "on-click": "wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle"
-  },
-  "backlight": { "format": "\uf185 {percent}%" },
-  "battery": {
-    "format": "{icon} {capacity}%",
-    "format-icons": ["\uf244", "\uf243", "\uf242", "\uf241", "\uf240"],
-    "states": { "warning": 25, "critical": 10 }
-  }
-}
-EOF
-
-w "$H/.config/waybar/style.css" <<'EOF'
-* { font-family: "DejaVu Sans Mono", "FontAwesome"; font-size: 11px; border: none; border-radius: 0; min-height: 0; }
-window#waybar {
-  background: rgba(13,17,27,0.82);
-  color: #cdd6f4;
-  border: 1px solid rgba(137,180,250,0.35);
-  border-radius: 10px;
-}
-tooltip { background: rgba(13,17,27,0.95); border: 1px solid rgba(137,180,250,0.40); border-radius: 8px; }
-tooltip label { color: #cdd6f4; }
-#clock, #pulseaudio, #backlight, #battery, #language, #tray { padding: 0 7px; }
-#custom-launcher, #custom-files, #custom-term { color: #89b4fa; padding: 0 7px; }
-#custom-launcher { margin-left: 4px; }
-#custom-power { color: #f38ba8; padding: 0 10px 0 7px; }
-#clock { color: #b4d0ff; font-weight: bold; }
-#language { color: #74c7ec; }
-#pulseaudio.muted, #pulseaudio.source-muted { color: #5c6b8a; }
-#backlight { color: #a6c8ff; }
-#workspaces { margin-left: 6px; }
-#workspaces button {
-  color: #7f8fae; background: rgba(137,180,250,0.10);
-  padding: 0; margin: 4px 2px; min-width: 16px; border-radius: 9px;
-  box-shadow: none; text-shadow: none;
-}
-#workspaces button:hover { background: rgba(137,180,250,0.30); color: #e6ecf8; }
-#workspaces button.active { background: #89b4fa; color: #0d111b; min-width: 28px; }
-#battery.warning { color: #f9e2af; }
-#battery.critical { color: #f38ba8; }
-EOF
-
-# ---------- wofi ----------
-w "$H/.config/wofi/config" <<'EOF'
-width=520
-height=330
-prompt=Поиск...
-allow_images=true
-image_size=20
-insensitive=true
-hide_on_select=true
-EOF
-w "$H/.config/wofi/style.css" <<'EOF'
-window { background-color: rgba(13,17,27,0.88); border: 1px solid rgba(137,180,250,0.40); border-radius: 10px; font-family: "DejaVu Sans Mono"; font-size: 12px; }
-#input { background: rgba(137,180,250,0.08); color: #cdd6f4; border: 1px solid rgba(137,180,250,0.25); border-radius: 8px; margin: 6px; }
-#entry { padding: 4px 8px; border-radius: 6px; }
-#entry:selected { background-color: rgba(137,180,250,0.25); }
-#text { color: #cdd6f4; margin-left: 6px; }
-EOF
-
-# ---------- GTK, fastfetch, обои ----------
-w "$H/.config/gtk-3.0/settings.ini" <<'EOF'
+[colors.bright]
+black = "#687267"
+red = "#d28b7f"
+green = "#a9bb7a"
+yellow = "#d1bd82"
+blue = "#9aab91"
+magenta = "#b29ab2"
+cyan = "#9ab9ae"
+white = "#f0f4e9"
+ALACRITTY
+write_file "$CONFIG_ROOT/gtk-3.0/settings.ini" 0644 <<'GTK'
 [Settings]
+gtk-theme-name=Adwaita-dark
+gtk-icon-theme-name=Adwaita
+gtk-font-name=DejaVu Sans 10
 gtk-application-prefer-dark-theme=1
-gtk-icon-theme-name=Papirus-Dark
-EOF
+GTK
+mkdir -p "$CONFIG_ROOT/qt6ct/colors"
+write_file "$CONFIG_ROOT/qt6ct/colors/olive.conf" 0644 <<'QTCOLORS'
+[ColorScheme]
+active_colors=#ffe1e7df, #ff202a21, #ff35452f, #ff526447, #ff0b0f0c, #ff2a332a, #ffe1e7df, #ffffffff, #ffe1e7df, #ff111512, #ff111512, #ff000000, #ff46583b, #fff0f4e9, #ffa9bb7a, #ff879b60, #ff171e18, #ffe1e7df, #ff171e18, #ffe1e7df, #ff8b9689, #ff71834b
+inactive_colors=#ffe1e7df, #ff202a21, #ff35452f, #ff526447, #ff0b0f0c, #ff2a332a, #ffe1e7df, #ffffffff, #ffe1e7df, #ff111512, #ff111512, #ff000000, #ff405238, #fff0f4e9, #ffa9bb7a, #ff879b60, #ff171e18, #ffe1e7df, #ff171e18, #ffe1e7df, #ff8b9689, #ff71834b
+disabled_colors=#ff7c887a, #ff1a211b, #ff293329, #ff3b4938, #ff0b0f0c, #ff202820, #ff7c887a, #ffb8c0b5, #ff7c887a, #ff111512, #ff111512, #ff000000, #ff35452f, #ffb8c0b5, #ff75865a, #ff687b58, #ff171e18, #ff7c887a, #ff171e18, #ff7c887a, #ff657064, #ff526447
+QTCOLORS
+write_file "$CONFIG_ROOT/qt6ct/qt6ct.conf" 0644 <<QTCONF
+[Appearance]
+color_scheme_path=$CONFIG_ROOT/qt6ct/colors/olive.conf
+custom_palette=true
+icon_theme=Adwaita
+style=Fusion
+standard_dialogs=default
+QTCONF
+write_file "$CONFIG_ROOT/mako/config" 0644 <<'MAKO'
+font=DejaVu Sans 10
+background-color=#171e18
+text-color=#e1e7df
+border-color=#71834b
+border-size=1
+border-radius=8
+padding=10
+margin=8
+default-timeout=5000
+ignore-timeout=0
+MAKO
+write_file "$CONFIG_ROOT/cava/config" 0644 <<'CAVA'
+[general]
+framerate = 30
+bars = 0
 
-# Картинка для fastfetch: положи PNG в ~/.config/fastfetch/logo.png (лучше 512x512)
-w "$H/.config/fastfetch/show.sh" <<'EOF'
-#!/bin/sh
-LOGO="$HOME/.config/fastfetch/logo.png"
-if [ -f "$LOGO" ]; then
-  fastfetch --logo "$LOGO" --logo-type chafa --logo-width 30 --logo-height 15
-else
-  fastfetch --logo none
-fi
-exec bash
-EOF
+[output]
+method = ncurses
 
-w "$H/.config/hypr/wallpaper.sh" <<'EOF'
-#!/bin/sh
-# Обои: положи картинки в ~/Pictures/wall, Super+W - следующая
-D="$HOME/Pictures/wall"; C="$HOME/.cache/wallpaper"
-list="$(ls "$D"/*.png "$D"/*.jpg "$D"/*.jpeg "$D"/*.webp 2>/dev/null)"
-pkill swaybg 2>/dev/null
-[ -n "$list" ] || exec swaybg -c 0d111b
-cur="$(cat "$C" 2>/dev/null)"
-if [ "$1" = next ]; then
-  f="$(printf '%s\n' "$list" | awk -v c="$cur" 'f{print;exit} $0==c{f=1}')"
-  [ -n "$f" ] || f="$(printf '%s\n' "$list" | head -n1)"
-else
-  f="$cur"; [ -f "$f" ] || f="$(printf '%s\n' "$list" | head -n1)"
-fi
-mkdir -p "$(dirname "$C")"; printf '%s\n' "$f" > "$C"
-exec swaybg -i "$f" -m fill
-EOF
+[colors]
+foreground = '#a9bb7a'
+gradient = 1
+gradient_color_1 = '#526447'
+gradient_color_2 = '#71834b'
+gradient_color_3 = '#879b60'
+gradient_color_4 = '#a9bb7a'
+CAVA
 
-# ---------- ярлыки и программы по умолчанию ----------
-w "$H/.local/share/applications/cava.desktop" <<'EOF'
-[Desktop Entry]
-Type=Application
-Name=cava
-Exec=cava
-NoDisplay=true
-EOF
-w "$H/.local/share/applications/files.desktop" <<'EOF'
+# MIME: Files — файловый менеджер; пакетные архивы — безопасный обработчик с подтверждением.
+write_file "$TARGET_HOME/.local/share/applications/files.desktop" 0644 <<'DESKTOP'
 [Desktop Entry]
 Type=Application
 Name=Files
-Exec=/usr/local/bin/files %f
+Exec=/usr/local/bin/files %U
 Icon=system-file-manager
 Terminal=false
 Categories=System;FileManager;
 MimeType=inode/directory;
 StartupWMClass=files
-EOF
-w "$H/.local/share/applications/pkg-install.desktop" <<'EOF'
+DESKTOP
+write_file "$TARGET_HOME/.local/share/applications/arch-package-install.desktop" 0644 <<'PKGDESK'
 [Desktop Entry]
 Type=Application
 Name=Установщик пакетов Arch
-Exec=/usr/local/bin/pkg-install %f
+Exec=alacritty --title "Установка пакета Arch" -e /usr/local/bin/arch-package-install %f
+Icon=package-x-generic
 Terminal=false
 NoDisplay=true
-MimeType=application/x-zstd-compressed-tar;
-EOF
-w "$H/.config/mimeapps.list" <<'EOF'
+MimeType=application/x-compressed-tar;application/zstd;application/x-zstd;application/x-zstd-compressed-tar;application/x-xz-compressed-tar;
+PKGDESK
+write_file "$TARGET_HOME/.config/mimeapps.list" 0644 <<'MIME'
 [Default Applications]
 inode/directory=files.desktop
-image/png=firefox.desktop
-image/jpeg=firefox.desktop
-image/gif=firefox.desktop
-image/webp=firefox.desktop
-image/svg+xml=firefox.desktop
-application/pdf=firefox.desktop
-video/mp4=firefox.desktop
-video/webm=firefox.desktop
-audio/mpeg=firefox.desktop
-audio/ogg=firefox.desktop
-audio/flac=firefox.desktop
-audio/x-wav=firefox.desktop
-x-scheme-handler/http=firefox.desktop
-x-scheme-handler/https=firefox.desktop
-text/html=firefox.desktop
-EOF
+application/x-zstd-compressed-tar=arch-package-install.desktop
+application/zstd=arch-package-install.desktop
+application/x-zstd=arch-package-install.desktop
+application/x-compressed-tar=arch-package-install.desktop
+application/x-xz-compressed-tar=arch-package-install.desktop
+MIME
 
-# ---------- bash ----------
-grep -qF '38;5;111m' "$H/.bashrc" 2>/dev/null || cat >> "$H/.bashrc" <<'EOF'
-PS1='\[\e[38;5;111m\]\u \[\e[38;5;67m\]\w \[\e[0m\]\$ '
-EOF
-# автозапуск Hyprland на TTY1
-if ! grep -qsi 'hyprland' "$H/.bash_profile"; then
-  [ -f "$H/.bash_profile" ] || echo '[ -f ~/.bashrc ] && . ~/.bashrc' > "$H/.bash_profile"
-  cat >> "$H/.bash_profile" <<'EOF'
-if [ -z "${WAYLAND_DISPLAY:-}" ] && [ "${XDG_VTNR:-}" = 1 ]; then
-  start-hyprland || exec bash
-fi
-EOF
-fi
-mkdir -p "$H/Pictures/wall"
+# Установка сторонних приложений. GitHub API используется только для выбора официального asset.
+write_file "$LIB_ROOT/github-asset.py" 0644 <<'GH'
+#!/usr/bin/env python3
+import json,re,sys,urllib.request
+repo,pattern=sys.argv[1],sys.argv[2]
+req=urllib.request.Request("https://api.github.com/repos/"+repo+"/releases?per_page=30",headers={"User-Agent":"hypr-minimal-installer"})
+try:
+ data=json.load(urllib.request.urlopen(req,timeout=25))
+ for rel in data:
+  if rel.get("draft") or rel.get("prerelease"): continue
+  for a in rel.get("assets",[]):
+   if re.search(pattern,a.get("name",""),re.I):
+    print(a["browser_download_url"]);print(a.get("digest") or "")
+    raise SystemExit(0)
+except Exception as e:
+ print("GitHub API: "+str(e),file=sys.stderr)
+raise SystemExit(1)
+GH
 
-# реальное имя Font Awesome (иконки в waybar, меню питания)
-FA="$(fc-list : family 2>/dev/null | grep -o 'Font Awesome [0-9]* Free' | head -n1 || true)"
-FA="${FA:-Font Awesome 7 Free} Solid"
-sed -i "s/FontAwesome/$FA/g" /usr/local/bin/power-menu \
-  "$H/.config/waybar/style.css"
-
-chown -R "$U:$G" "$H/.config" "$H/.local" "$H/Pictures" "$H/.bashrc" "$H/.bash_profile" 2>/dev/null || true
-runuser -u "$U" -- env HOME="$H" xdg-user-dirs-update 2>/dev/null || true
-
-# ================= сторонние приложения =================
-# fetch URL ФАЙЛ [sums] - скачать; с "sums" сверить SHA256 по SHA256SUMS.txt из того же релиза
-fetch() {
-  curl -fL --retry 3 -o "$2" "$1" || { rm -f "$2"; return 1; }
-  [ "${3:-}" = sums ] || return 0
-  local want have
-  want="$(curl -fsSL "${1%/*}/SHA256SUMS.txt" 2>/dev/null | grep -F "${1##*/}" | awk '{print $1}' | head -n1 || true)"
-  have="$(sha256sum "$2" | awk '{print $1}')"
-  [ -n "$want" ] && [ "$want" = "$have" ] || { echo "!! контрольная сумма не подтверждена: ${1##*/}"; rm -f "$2"; return 1; }
+fetch_file() {
+  local url="$1" dest="$2" digest="${3:-}" expected="${4:-}" tmp
+  mkdir -p "$(dirname "$dest")"
+  tmp="$(mktemp "${dest}.download.XXXXXX")"
+  if ! curl --fail --location --retry 3 --retry-all-errors --connect-timeout 20 --output "$tmp" "$url"; then
+    rm -f "$tmp"; return 1
+  fi
+  [[ -s "$tmp" ]] || { rm -f "$tmp"; return 1; }
+  if [[ "$digest" == sha256:* ]]; then
+    echo "${digest#sha256:}  $tmp" | sha256sum --check --status || { rm -f "$tmp"; warn "SHA-256 не совпал: $url"; return 1; }
+  else
+    warn "Источник не предоставил SHA-256 для $(basename "$dest"); скачивание защищено TLS, но контрольная сумма не подтверждена."
+  fi
+  if [[ "$expected" == elf ]]; then
+    local magic
+    magic="$(od -An -N4 -tx1 "$tmp" | tr -d ' \n')"
+    [[ "$magic" == 7f454c46 ]] || { rm -f "$tmp"; warn "Загруженный файл не похож на ELF/AppImage: $url"; return 1; }
+  fi
+  if ! mv -f -- "$tmp" "$dest"; then rm -f "$tmp"; return 1; fi
 }
-# gh_asset РЕПО РЕГУЛЯРКА [?per_page=30] - ссылка на файл из последнего релиза на GitHub
 gh_asset() {
-  curl -fsSL "https://api.github.com/repos/$1/releases${3:-/latest}" 2>/dev/null \
-    | grep -o 'https://[^"]*' | grep -E "$2" | head -n1 || true
+  local data url digest
+  data="$(python "$LIB_ROOT/github-asset.py" "$1" "$2" 2>/dev/null)" || return 1
+  url="$(printf '%s\n' "$data" | sed -n '1p')"
+  digest="$(printf '%s\n' "$data" | sed -n '2p')"
+  [[ -n "$url" ]] || return 1
+  printf '%s\n%s\n' "$url" "$digest"
 }
-# install_pkg ССЫЛКА ИМЯ [sums] - готовый .pkg.tar.zst
-install_pkg() {
-  local f="/tmp/$2.pkg.tar.zst"
-  if ! fetch "$1" "$f" "${3:-}"; then
-    echo "!! $2 не скачался ($1)."
-    echo "!! Скачай .pkg.tar.zst вручную и открой его двойным щелчком в Files (Super+E)."
-    return 0
-  fi
-  pacman -U --noconfirm "$f" || echo "!! $2 не установился (скрипт продолжает работу)"
-  rm -f "$f"
-}
-# install_appimage ССЫЛКА КОМАНДА НАЗВАНИЕ КАТЕГОРИИ [sums]
 install_appimage() {
-  local url="$1" bin="$2" title="$3" cats="$4" P="/opt/$2" run icon src
-  if [ ! -x "$P/squashfs-root/AppRun" ]; then
-    mkdir -p "$P"; rm -rf "$P/squashfs-root"
-    if fetch "$url" "$P/app.AppImage" "${5:-}"; then
-      chmod 755 "$P/app.AppImage"
-      ( cd "$P" && ./app.AppImage --appimage-extract >/dev/null 2>&1 && rm -f app.AppImage ) || true
-    fi
-  fi
-  chmod -R a+rX "$P" 2>/dev/null || true
-  [ ! -f "$P/squashfs-root/chrome-sandbox" ] || { chown root:root "$P/squashfs-root/chrome-sandbox"; chmod 4755 "$P/squashfs-root/chrome-sandbox"; }
-  if [ -x "$P/squashfs-root/AppRun" ]; then run="$P/squashfs-root/AppRun"
-  elif [ -x "$P/app.AppImage" ]; then run="$P/app.AppImage --appimage-extract-and-run"
-  else echo "!! $title не поставился: нет доступа к сайту/GitHub. Включи VPN (Happ) и запусти install.sh ещё раз."; return 0; fi
-  printf '#!/bin/sh\n%sexec %s "$@"\n' "${APPENV:-}" "$run" > "/usr/local/bin/$bin"
-  chmod 755 "/usr/local/bin/$bin"
-  # иконка: сначала .DirIcon (официальная иконка AppImage), потом из usr/share/icons, потом любая png в корне
-  src=""
-  if [ -f "$P/squashfs-root/.DirIcon" ] && [ "$(head -c 4 "$P/squashfs-root/.DirIcon" 2>/dev/null | tail -c 3)" = PNG ]; then
-    src="$P/squashfs-root/.DirIcon"
-  fi
-  [ -n "$src" ] || src="$(find "$P/squashfs-root/usr/share/icons" -name '*.png' 2>/dev/null | sort -V | tail -n1 || true)"
-  [ -n "$src" ] || src="$(find "$P/squashfs-root" -maxdepth 1 -name '*.png' 2>/dev/null | head -n1 || true)"
-  icon=application-x-executable
-  if [ -n "$src" ] && [ -f "$src" ]; then
-    install -Dm644 "$src" "/usr/share/icons/hicolor/256x256/apps/$bin.png"
-    icon="$bin"
-  fi
-  cat > "/usr/share/applications/$bin.desktop" <<DESK_EOF
+  local repo="$1" pattern="$2" name="$3" title="$4" category="$5" url digest dir
+  local -a asset
+  if ! mapfile -t asset < <(gh_asset "$repo" "$pattern"); then warn "$title: не удалось получить release asset."; return 1; fi
+  url="${asset[0]:-}"; digest="${asset[1]:-}"
+  [[ -n "$url" ]] || { warn "$title: подходящий asset не найден."; return 1; }
+  dir="$APP_ROOT/$name"; install -d -m 0755 "$dir"
+  if ! fetch_file "$url" "$dir/$name.AppImage" "$digest" elf; then warn "$title: загрузка/проверка не удалась."; return 1; fi
+  chmod 0755 "$dir/$name.AppImage"
+  cat > "$BIN_ROOT/$name" <<EOF
+#!/usr/bin/env bash
+unset __NV_PRIME_RENDER_OFFLOAD __NV_PRIME_RENDER_OFFLOAD_PROVIDER __VK_LAYER_NV_optimus
+export DRI_PRIME=pci-0000_00_02_0!
+export __GLX_VENDOR_LIBRARY_NAME=mesa
+export LIBVA_DRIVER_NAME=iHD
+export VK_LOADER_DRIVERS_SELECT="*intel_icd*"
+exec "$dir/$name.AppImage" --appimage-extract-and-run "\$@"
+EOF
+  chmod 0755 "$BIN_ROOT/$name"
+  cat > "/usr/share/applications/$name.desktop" <<EOF
 [Desktop Entry]
 Type=Application
 Name=$title
-Exec=$bin
-Icon=$icon
+Exec=$BIN_ROOT/$name %U
+Icon=application-x-executable
 Terminal=false
-Categories=$cats
-DESK_EOF
-  echo "ok: $title"
+Categories=$category
+EOF
+  log "$title установлен."
 }
-install_photocraft() {
-  local u
-  u="$(gh_asset storytold/photocraft 'x86_64.*\.pkg\.tar\.zst$')"
-  if [ -n "$u" ]; then install_pkg "$u" photocraft sums; return 0; fi
-  u="$(gh_asset storytold/photocraft 'x86_64.*\.AppImage$')"
-  if [ -n "$u" ]; then install_appimage "$u" photocraft PhotoCraft "Graphics;" sums; return 0; fi
-  echo "!! PhotoCraft: не нашёл сборку. Скачай её (Linux x86_64) со страницы"
-  echo "!! https://github.com/storytold/photocraft/releases"
+install_arch_release() {
+  local repo="$1" pattern="$2" pkgname="$3" url digest tmp
+  local -a asset
+  if ! mapfile -t asset < <(gh_asset "$repo" "$pattern"); then warn "$pkgname: не найден официальный пакет релиза."; return 1; fi
+  url="${asset[0]:-}"; digest="${asset[1]:-}"
+  [[ -n "$url" ]] || { warn "$pkgname: пакет не найден."; return 1; }
+  tmp="$(mktemp --suffix=.pkg.tar.zst)"
+  if ! fetch_file "$url" "$tmp" "$digest"; then rm -f "$tmp"; return 1; fi
+  pacman -U --needed -- "$tmp" || { warn "$pkgname: pacman не установил пакет (подписи pacman не отключались)."; rm -f "$tmp"; return 1; }
+  rm -f "$tmp"
 }
-install_limusic() {
-  local u
-  u="$(gh_asset SimoHypers/limusic '(x86_64|amd64).*\.AppImage$')"
-  if [ -n "$u" ]; then APPENV='export WEBKIT_DISABLE_DMABUF_RENDERER=1
-' install_appimage "$u" limusic Limusic "AudioVideo;Audio;Player;"
-  else echo "!! Limusic: не нашёл AppImage на https://github.com/SimoHypers/limusic/releases"; fi
-}
-install_opencode() {
-  local u
-  u="$(gh_asset anomalyco/opencode 'opencode-desktop-linux-(x86_64|amd64|x64)\.AppImage$' '?per_page=30')"
-  if [ -n "$u" ]; then install_appimage "$u" opencode OpenCode "Development;"
-  else echo "!! OpenCode: не нашёл AppImage на https://github.com/anomalyco/opencode/releases"; fi
-}
-install_pkg https://github.com/Happ-proxy/happ-desktop/releases/latest/download/Happ.linux.x64.pkg.tar.zst happ
-install_photocraft
-install_appimage https://download.onlyoffice.com/install/desktop/editors/linux/DesktopEditors-x86_64.AppImage onlyoffice "ONLYOFFICE" "Office;"
-install_limusic
-install_opencode
-gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor 2>/dev/null || true
+log "Дополнительные приложения (каждое устанавливается независимо)"
+install_arch_release "Happ-proxy/happ-desktop" '^Happ\.linux\.x64\.pkg\.tar\.zst$' happ || install_appimage "Happ-proxy/happ-desktop" 'Happ.*(x64|x86_64).*\.AppImage$' happ "Happ" "Network;" || true
+install_arch_release "storytold/photocraft" 'x86_64.*\.pkg\.tar\.zst$' photocraft || install_appimage "storytold/photocraft" 'x86_64.*\.AppImage$' photocraft "PhotoCraft" "Graphics;" || true
+# ONLYOFFICE — официальный сайт разработчика; checksum используется только если опубликована отдельно.
+ONLYOFFICE_URL="https://download.onlyoffice.com/install/desktop/editors/linux/DesktopEditors-x86_64.AppImage"
+install -d -m 0755 "$APP_ROOT/onlyoffice"
+if fetch_file "$ONLYOFFICE_URL" "$APP_ROOT/onlyoffice/onlyoffice.AppImage" "" elf; then
+  chmod 0755 "$APP_ROOT/onlyoffice/onlyoffice.AppImage"
+  cat > "$BIN_ROOT/onlyoffice" <<EOF
+#!/usr/bin/env bash
+unset __NV_PRIME_RENDER_OFFLOAD __NV_PRIME_RENDER_OFFLOAD_PROVIDER __VK_LAYER_NV_optimus
+export DRI_PRIME=pci-0000_00_02_0! __GLX_VENDOR_LIBRARY_NAME=mesa LIBVA_DRIVER_NAME=iHD
+export VK_LOADER_DRIVERS_SELECT="*intel_icd*"
+exec "$APP_ROOT/onlyoffice/onlyoffice.AppImage" --appimage-extract-and-run "\$@"
+EOF
+  chmod 0755 "$BIN_ROOT/onlyoffice"
+  cat > /usr/share/applications/onlyoffice.desktop <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=ONLYOFFICE
+Exec=/usr/local/bin/onlyoffice %U
+Icon=application-x-executable
+Terminal=false
+Categories=Office;
+EOF
+else warn "ONLYOFFICE: загрузка с официального сайта не удалась."; fi
+install_appimage "SimoHypers/limusic" '(x86_64|amd64).*\.AppImage$' limusic "Limusic" "AudioVideo;Audio;Player;" || true
+install_appimage "anomalyco/opencode" 'opencode-desktop-linux-(x86_64|amd64|x64).*\.AppImage$' opencode "OpenCode" "Development;" || true
 
-# ================= wofi: в лаунчере только твои приложения =================
-allow="$( { for p in steam telegram-desktop prismlauncher happ firefox photocraft; do pacman -Ql "$p" 2>/dev/null; done \
-  | awk '{print $2}' | grep '^/usr/share/applications/.*\.desktop$' | while read -r f; do basename "$f"; done
-  printf '%s\n' onlyoffice.desktop photocraft.desktop limusic.desktop opencode.desktop; } )"
-mkdir -p "$H/.local/share/applications"
-for f in /usr/share/applications/*.desktop; do
-  [ -e "$f" ] || continue
-  b="${f##*/}"; t="$H/.local/share/applications/$b"
-  if printf '%s\n' "$allow" | grep -qxF "$b"; then
-    { [ ! -f "$t" ] || ! grep -q '^# hidden-by-install' "$t"; } || rm -f "$t"
-    continue
+# Wofi показывает только приложения из пользовательского allowlist.
+# Системные desktop-файлы не удаляются: создаются пользовательские NoDisplay overrides.
+WOFI_HIDE_DIR="$TARGET_HOME/.local/share/applications"
+install -d -o "$TARGET_USER" -g "$TARGET_GROUP" "$WOFI_HIDE_DIR"
+python - "$WOFI_HIDE_DIR" "$BACKUP_ROOT" <<'WOFI_CURATE'
+import os, re, shutil, sys
+from pathlib import Path
+user_apps, backup_root = Path(sys.argv[1]), Path(sys.argv[2])
+allowed = re.compile(r'firefox|telegram|steam|prism|onlyoffice|happ|photocraft|limusic|opencode|metadata.?cleaner|(^|[^a-z])files([^a-z]|$)|alacritty', re.I)
+old_override = '[Desktop Entry]\nType=Application\nName=Служебная запись\nNoDisplay=true\n'
+
+def is_allowed(path, data):
+    names = re.findall(r'^(?:Name|Name\[[^]]+\])=(.*)$', data, re.M)
+    return bool(allowed.search(path.stem) or any(allowed.search(n) for n in names))
+
+# Include both system locations and user-created desktop files.
+all_entries = {}
+for directory in (Path('/usr/share/applications'), Path('/usr/local/share/applications'), user_apps):
+    if directory.is_dir():
+        for src in directory.glob('*.desktop'):
+            all_entries.setdefault(src.name, src)
+for desktop_id, src in all_entries.items():
+    try:
+        data = src.read_text(errors='replace')
+    except OSError:
+        continue
+    if not re.search(r'^Type=Application\s*$', data, re.M):
+        continue
+    dst = user_apps / desktop_id
+    # Remove a previously generated override if the desktop entry is now allowed.
+    if is_allowed(src, data):
+        try:
+            if dst.is_file() and not dst.is_symlink() and dst.read_text(errors='replace') == old_override:
+                dst.unlink()
+        except OSError:
+            pass
+        continue
+    # Already hidden entries (including the package-installer MIME handler) stay intact.
+    if re.search(r'^(?:NoDisplay|Hidden)=true\s*$', data, re.M):
+        continue
+    # Keep an existing custom desktop file in the timestamped backup before hiding it.
+    if dst.is_symlink():
+        backup = backup_root / str(dst).lstrip('/')
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        backup.write_text('SYMLINK -> ' + os.readlink(dst) + '\n')
+        dst.unlink()
+    elif dst.exists() and dst.read_text(errors='replace') != old_override:
+        backup = backup_root / str(dst).lstrip('/')
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(dst, backup)
+    dst.write_text(old_override)
+    os.chmod(dst, 0o644)
+WOFI_CURATE
+chown -R "$TARGET_USER:$TARGET_GROUP" "$WOFI_HIDE_DIR"
+
+# Steam должен использовать Intel ICD, включая 32-битный Vulkan.
+# Для приложений в пользовательской сессии экспортируем только выбор Intel, не добавляя PRIME-переключение.
+write_file "$CONFIG_ROOT/environment.d/90-intel-gpu.conf" 0644 <<ENV
+DRI_PRIME=pci-0000_00_02_0!
+__GLX_VENDOR_LIBRARY_NAME=mesa
+LIBVA_DRIVER_NAME=iHD
+VK_LOADER_DRIVERS_SELECT=*intel_icd*
+QT_QPA_PLATFORMTHEME=qt6ct
+QT_STYLE_OVERRIDE=Fusion
+ENV
+
+# Автозапуск Hyprland только в интерактивной локальной TTY1.
+USER_SHELL="$(getent passwd "$TARGET_USER" | cut -d: -f7)"
+case "${USER_SHELL##*/}" in
+  bash) PROFILE="$TARGET_HOME/.bash_profile"; PROFILE_KIND=bash ;;
+  zsh) PROFILE="$TARGET_HOME/.zprofile"; PROFILE_KIND=zsh ;;
+  *) PROFILE=""; PROFILE_KIND=unsupported; warn "Автозапуск TTY1 не добавлен: оболочка $USER_SHELL не поддержана этим блоком. Запускай start-hyprland-intel вручную." ;;
+esac
+if [[ -n "$PROFILE" ]]; then
+  if [[ ! -e "$PROFILE" ]]; then
+    if [[ "$PROFILE_KIND" == bash ]]; then
+      write_file "$PROFILE" 0644 <<'BPROFILE'
+[[ -f ~/.bashrc ]] && . ~/.bashrc
+BPROFILE
+    else
+      write_file "$PROFILE" 0644 <<'ZPROFILE'
+[[ -f ~/.zshrc ]] && . ~/.zshrc
+ZPROFILE
+    fi
   fi
-  { [ ! -e "$t" ] || grep -q '^# hidden-by-install' "$t"; } || continue
-  { echo '# hidden-by-install'
-    awk '/^NoDisplay=/{next} {print} !d && /^\[Desktop Entry\]/{print "NoDisplay=true"; d=1}' "$f"; } > "$t"
+  if ! grep -q 'HYPR_MINIMAL_TTY1' "$PROFILE"; then
+    backup_file "$PROFILE"
+    cat >> "$PROFILE" <<'LOGIN_PROFILE'
+
+# HYPR_MINIMAL_TTY1: запуск только в первой локальной консоли.
+if [[ -z "${WAYLAND_DISPLAY:-}" && -z "${DISPLAY:-}" && "${XDG_VTNR:-0}" == "1" && -t 0 ]]; then
+    export DRI_PRIME=pci-0000_00_02_0!
+    export __GLX_VENDOR_LIBRARY_NAME=mesa
+    export VK_LOADER_DRIVERS_SELECT="*intel_icd*"
+    exec /usr/local/bin/start-hyprland-intel
+fi
+LOGIN_PROFILE
+  fi
+fi
+
+# power-profiles-daemon — единственный управляющий профильный сервис.
+# Не выключаем сторонние службы без согласия пользователя.
+CONFLICTS=()
+for svc in tlp.service auto-cpufreq.service tuned.service; do
+  if systemctl is-active --quiet "$svc" || systemctl is-enabled --quiet "$svc" 2>/dev/null; then CONFLICTS+=("$svc"); fi
 done
-chown -R "$U:$G" "$H/.local" 2>/dev/null || true
-rm -f "$H/.cache/wofi-drun"
+POWER_PROFILE_DAEMON_READY=1
+if ((${#CONFLICTS[@]})); then
+  printf 'Обнаружены потенциально конфликтующие службы: %s\n' "${CONFLICTS[*]}"
+  read -r -p "Отключить их (пакеты и настройки останутся) и использовать power-profiles-daemon? [y/N] " answer
+  if [[ "$answer" =~ ^[YyДд]$ ]]; then
+    for svc in "${CONFLICTS[@]}"; do systemctl disable --now "$svc" || warn "Не удалось отключить $svc"; done
+  else
+    POWER_PROFILE_DAEMON_READY=0
+    warn "Конфликтующие службы оставлены без изменений; меню профилей питания будет недоступно до ручного выбора одного менеджера."
+  fi
+fi
+if ((POWER_PROFILE_DAEMON_READY)); then systemctl enable --now power-profiles-daemon.service; fi
+# Включаем пользовательские сокеты PipeWire и WirePlumber без запуска лишних демонов от root.
+USER_SYSTEMD="$TARGET_HOME/.config/systemd/user"
+install -d "$USER_SYSTEMD/sockets.target.wants" "$USER_SYSTEMD/default.target.wants"
+for unit in pipewire.socket pipewire-pulse.socket; do
+  src="/usr/lib/systemd/user/$unit"; dst="$USER_SYSTEMD/sockets.target.wants/$unit"
+  if [[ -e "$src" && ! -e "$dst" && ! -L "$dst" ]]; then ln -s "$src" "$dst"; fi
+done
+if [[ -e /usr/lib/systemd/user/wireplumber.service && ! -e "$USER_SYSTEMD/default.target.wants/wireplumber.service" && ! -L "$USER_SYSTEMD/default.target.wants/wireplumber.service" ]]; then
+  ln -s /usr/lib/systemd/user/wireplumber.service "$USER_SYSTEMD/default.target.wants/wireplumber.service"
+fi
+chown -R "$TARGET_USER:$TARGET_GROUP" "$USER_SYSTEMD"
+runuser -u "$TARGET_USER" -- env XDG_RUNTIME_DIR="/run/user/$TARGET_UID" systemctl --user daemon-reload 2>/dev/null || true
 
-# ================= чистка =================
-echo "=== Чистка мусора ==="
-orph="$(pacman -Qdtq 2>/dev/null || true)"
-[ -z "$orph" ] || pacman -Rns --noconfirm $orph || true
-pacman -Sc --noconfirm >/dev/null 2>&1 || true
-journalctl --vacuum-size=50M >/dev/null 2>&1 || true
-rm -f /tmp/*.pkg.tar.zst
-rm -rf "$H/.cache/thumbnails"
+# Записи desktop/MIME и права пользователя.
+runuser -u "$TARGET_USER" -- env HOME="$TARGET_HOME" xdg-user-dirs-update >/dev/null 2>&1 || true
+runuser -u "$TARGET_USER" -- env HOME="$TARGET_HOME" xdg-mime default files.desktop inode/directory >/dev/null 2>&1 || true
+runuser -u "$TARGET_USER" -- env HOME="$TARGET_HOME" xdg-mime default arch-package-install.desktop application/zstd >/dev/null 2>&1 || true
+update-desktop-database "$TARGET_HOME/.local/share/applications" >/dev/null 2>&1 || true
+chown "$TARGET_USER:$TARGET_GROUP" "$PROFILE" 2>/dev/null || true
+chown -R "$TARGET_USER:$TARGET_GROUP" "$CONFIG_ROOT" "$TARGET_HOME/.local" "$TARGET_HOME/Pictures" 2>/dev/null || true
+install -d -o "$TARGET_USER" -g "$TARGET_GROUP" "$TARGET_HOME/.local/state/hypr-minimal" "$TARGET_HOME/Pictures/wall"
 
-echo
-echo "Готово. ПЕРЕЗАГРУЗИСЬ (reboot). После входа на TTY1 Hyprland запустится сам."
-echo "NVIDIA: драйверы удалены - система работает на встройке (Intel)."
-echo "Обои: положи картинки в ~/Pictures/wall (светлые аниме-обои дадут вид как на фото)."
-echo "Визуализатор: открой терминал и набери  cava"
-echo
-echo "Горячие клавиши:"
-echo "  Super+Enter       - терминал с fastfetch"
-echo "  Super+D           - лаунчер (повторное нажатие закрывает)"
-echo "  Super+E           - файлы"
-echo "  Super+B           - Firefox"
-echo "  Super+W           - следующие обои"
-echo "  Super+V           - окно: плавающее / тайлинг"
-echo "  Super+F           - полный экран"
-echo "  Super+Shift+Esc   - меню питания (повторное нажатие закрывает)"
-echo "  Super+Q           - закрыть окно"
-echo "  Super+Shift+Q     - зажми и води курсором: окна под ним закрываются подряд"
-echo "  Super+Shift+S     - скриншот области в буфер"
+# Статическая проверка синтаксиса файлов, которые можно проверить без графической сессии.
+log "Проверка созданных файлов"
+for f in "$BIN_ROOT/arch-package-install" "$BIN_ROOT/files" "$BIN_ROOT/power-menu" "$BIN_ROOT/performance-menu" "$BIN_ROOT/hypr-wallpaper-next" "$BIN_ROOT/hypr-restore-profile" "$BIN_ROOT/hypr-launcher"; do bash -n "$f"; done
+python -m py_compile "$LIB_ROOT/files.py" "$LIB_ROOT/menu.py" "$LIB_ROOT/github-asset.py"
+python -m json.tool "$CONFIG_ROOT/waybar/config.jsonc" >/dev/null
+# Hyprland --verify-config поддерживается текущими сборками; проверяем, если установленный бинарник это умеет.
+if command -v luac >/dev/null 2>&1; then
+  luac -p "$CONFIG_ROOT/hypr/hyprland.lua"
+else
+  warn "luac не найден; Lua-конфигурация не прошла локальную синтаксическую проверку."
+fi
+
+# Проверяем наличие дискретного GPU и драйверных пакетов. Ничего не удаляем и не меняем вслепую.
+log "Аудит NVIDIA (без удаления драйверов и без опасного отключения PCIe)"
+if pacman -Qq 2>/dev/null | grep -Ei '^(nvidia|nvidia-open|nvidia-utils|lib32-nvidia|opencl-nvidia|cuda|bumblebee|optimus-manager)'; then
+  warn "Обнаружены NVIDIA/CUDA/Optimus-пакеты. Они не удаляются; выбор GPU для сеанса ограничен Intel."
+else
+  log "Пакеты NVIDIA/CUDA/Optimus в pacman не обнаружены."
+fi
+# Останавливаем только фоновые NVIDIA-службы, которые не нужны для Intel-сеанса.
+for svc in nvidia-persistenced.service nvidia-powerd.service; do
+  if systemctl is-active --quiet "$svc" || systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+    systemctl disable --now "$svc" || warn "Не удалось остановить $svc; проверь вручную."
+  fi
+done
+if lsmod | grep -qE '^(nvidia|nouveau)'; then
+  warn "Модуль NVIDIA/nouveau уже загружен. Скрипт не выгружает его вслепую; проверь вывод lsmod и перезагрузи после настройки."
+fi
+if command -v lspci >/dev/null 2>&1; then
+  lspci -nnk | grep -A3 -Ei 'VGA compatible controller|3D controller|Display controller' || true
+fi
+log "Intel UHD подтверждена по PCI vendor ID 0x8086: $INTEL_DRM_CARD → $INTEL_CARD_REAL"
+log "AQ_DRM_DEVICES будет установлен до запуска Hyprland; Vulkan loader отфильтрован до Intel ICD (включая 32-битные приложения)"
+
+cat <<EOF
+
+Установка завершена для пользователя $TARGET_USER.
+
+Дальше:
+  1. Перезагрузи ноутбук или выйди и войди в TTY1.
+  2. Добавь обои в ~/Pictures/wall.
+  3. Проверь GPU: lspci -k, glxinfo -B (пакет mesa-utils при необходимости),
+     vulkaninfo --summary (пакет vulkan-tools при необходимости).
+  4. Проверь профили: powerprofilesctl get и powerprofilesctl list.
+
+Резервные копии: $BACKUP_ROOT
+NVIDIA-пакеты не удалялись. Hyprland стартует с AQ_DRM_DEVICES, указывающим только на подтверждённый Intel DRM node; приложения используют Intel PCI ID и Intel Vulkan ICD.
+Это программное ограничение, а не аппаратное отключение GTX 1650.
+EOF
