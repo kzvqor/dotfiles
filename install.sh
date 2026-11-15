@@ -73,14 +73,15 @@ fi
 log "Полное обновление Arch (необходимое условие корректной установки пакетов)"
 pacman -Syu --needed --noconfirm
 
-# Сначала фиксируем Intel Vulkan/OpenGL-провайдеры отдельной транзакцией до установки Steam.
+# Сначала фиксируем Intel Vulkan/OpenGL-провайдеры отдельной транзакцией.
+# Это не даёт pacman выбрать NVIDIA как провайдера Steam при разрешении зависимостей.
 INTEL_GRAPHICS_PACKAGES=(mesa vulkan-intel lib32-mesa lib32-vulkan-intel intel-media-driver)
-log "Установка графического стека Intel UHD"
+log "Установка только Intel-графического стека"
 pacman -S --needed --noconfirm "${INTEL_GRAPHICS_PACKAGES[@]}"
 
 CORE_PACKAGES=(
   hyprland xdg-desktop-portal-hyprland xdg-desktop-portal-gtk xorg-xwayland
-  waybar wofi alacritty qt6-wayland gsimplecal
+  waybar wofi alacritty qt6-wayland
   pipewire pipewire-pulse wireplumber
   grim slurp wl-clipboard brightnessctl
   swaybg
@@ -88,7 +89,7 @@ CORE_PACKAGES=(
   udisks2 gvfs xdg-utils xdg-user-dirs desktop-file-utils
   dbus libnotify power-profiles-daemon sudo polkit-gnome lua mako qt6ct
   fastfetch cava curl playerctl metadata-cleaner
-  ttf-dejavu ttf-jetbrains-mono-nerd ttf-nerd-fonts-symbols noto-fonts-emoji
+  ttf-dejavu ttf-jetbrains-mono-nerd noto-fonts-emoji
   adwaita-icon-theme
   firefox telegram-desktop prismlauncher jre21-openjdk
 )
@@ -108,21 +109,16 @@ if [[ ! -e "$SUDOERS_FILE" ]]; then
   fi
 fi
 
-# Строго проверяем и фиксируем только Intel UHD Graphics.
+# Строго выбираем Intel: если iGPU не обнаружена, не запускаем конфигурацию с возможным fallback на NVIDIA.
 [[ "$(uname -m)" == "x86_64" ]] || die "Поддерживается только x86_64."
 INTEL_DRM_CARD="/dev/dri/by-path/pci-0000:00:02.0-card"
-[[ -e "$INTEL_DRM_CARD" ]] || die "Не найден DRM-узел Intel UHD ($INTEL_DRM_CARD). Проверь драйвер i915 и /dev/dri/by-path."
+[[ -e "$INTEL_DRM_CARD" ]] || die "Не найден DRM-узел Intel UHD ($INTEL_DRM_CARD). Отказ от настройки, чтобы не допустить fallback на NVIDIA. Проверь i915 и /dev/dri/by-path."
 INTEL_CARD_REAL="$(readlink -f "$INTEL_DRM_CARD")"
 INTEL_CARD_NAME="${INTEL_CARD_REAL##*/}"
 INTEL_VENDOR="$(cat "/sys/class/drm/$INTEL_CARD_NAME/device/vendor" 2>/dev/null || true)"
 [[ "$INTEL_VENDOR" == "0x8086" ]] || die "Устройство $INTEL_DRM_CARD не подтверждено как Intel (vendor=$INTEL_VENDOR)."
-INTEL_DEVICE_ID="$(cat "/sys/class/drm/$INTEL_CARD_NAME/device/device" 2>/dev/null || true)"
-[[ "$INTEL_DEVICE_ID" =~ ^0x[0-9a-fA-F]+$ ]] || die "Не удалось определить PCI device ID для $INTEL_DRM_CARD."
-INTEL_VK_ID="8086:${INTEL_DEVICE_ID#0x}"
 INTEL_ICD="/usr/share/vulkan/icd.d/intel_icd.json"
 [[ -r "$INTEL_ICD" ]] || die "Не найден Intel Vulkan ICD ($INTEL_ICD), хотя vulkan-intel был запрошен."
-MESA_EGL_VENDOR="/usr/share/glvnd/egl_vendor.d/50_mesa.json"
-[[ -r "$MESA_EGL_VENDOR" ]] || die "Не найден Mesa EGL vendor JSON ($MESA_EGL_VENDOR), хотя mesa была запрошена."
 
 # Утилиты для локальных .pkg.tar.* устанавливаются только после явного подтверждения.
 install -d -m 0755 "$LIB_ROOT" "$APP_ROOT"
@@ -175,14 +171,14 @@ FILES, INFO = TRASH / "files", TRASH / "info"
 BOOKMARKS = HOME / ".config/files/bookmarks"
 CSS = b"""
 * { font-family: 'DejaVu Sans', sans-serif; font-size: 10pt; }
-window { background: #111512; color: #e1e7df; }
-headerbar, toolbar { background: #171d18; color: #e1e7df; }
-button { background: #202a21; color: #e1e7df; border: 1px solid #39483a; border-radius: 7px; padding: 5px 9px; }
-button:hover, button:checked { background: #354832; border-color: #82965a; }
-entry { background: #171e18; color: #e1e7df; border: 1px solid #526447; border-radius: 6px; padding: 6px; }
-treeview { background: #111512; color: #e1e7df; }
-treeview:selected { background: #405238; color: #fff; }
-.sidebar { background: #151b16; }
+window { background: #141a14; color: #e1e7df; }
+headerbar, toolbar { background: #1a211b; color: #e1e7df; }
+button { background: #1a211b; color: #e1e7df; border: 1px solid #3b4938; border-radius: 7px; padding: 5px 9px; }
+button:hover, button:checked { background: #2d3a2c; border-color: #a9bb7a; }
+entry { background: #1a211b; color: #e1e7df; border: 1px solid #526447; border-radius: 6px; padding: 6px; }
+treeview { background: #141a14; color: #e1e7df; }
+treeview:selected { background: #7d9460; color: #141a14; }
+.sidebar { background: #1a211b; }
 .dim-label { color: #a0aa9d; }
 """
 def css():
@@ -522,12 +518,12 @@ import os, subprocess
 import gi
 gi.require_version("Gtk","3.0")
 from gi.repository import Gtk,Gdk,GLib
-BG="#111512"; PANEL="#1a211b"; ACCENT="#71834b"; TEXT="#e1e7df"; MUTED="#a0aa9d"
+BG="#141a14"; PANEL="#1a211b"; ACCENT="#a9bb7a"; TEXT="#e1e7df"; MUTED="#a0aa9d"
 CSS=f"""
-window {{ background: rgba(5,8,6,0.82); color:{TEXT}; }}
-.panel {{ background: #1a211b; border: 1px solid #526447; border-radius: 16px; padding: 10px; }}
+window {{ background: rgba(14,19,14,0.84); color:{TEXT}; }}
+.panel {{ background: {PANEL}; border: 1px solid #526447; border-radius: 16px; padding: 10px; }}
 button {{ background:{PANEL}; color:{TEXT}; border:1px solid #3b4938; border-radius:10px; padding:12px 20px; }}
-button:hover, button:focus {{ background:#35452f; border:1px solid {ACCENT}; }}
+button:hover, button:focus {{ background:#2b3629; border:1px solid {ACCENT}; }}
 label {{ color:{TEXT}; }}
 .dim {{ color:{MUTED}; }}
 """
@@ -629,24 +625,23 @@ read -r profile < "$state"
 case "$profile" in performance|balanced|power-saver) powerprofilesctl set "$profile" || true ;; esac
 RESTORE
 
-# Запускаем композитор с AQ_DRM_DEVICES и переменными Intel UHD до инициализации Aquamarine.
+# Запускаем compositor с AQ_DRM_DEVICES до инициализации Aquamarine.
 write_file "$BIN_ROOT/start-hyprland-intel" 0755 <<START_INTEL
 #!/usr/bin/env bash
 set -Eeuo pipefail
 export AQ_DRM_DEVICES="$INTEL_DRM_CARD"
+unset __NV_PRIME_RENDER_OFFLOAD __NV_PRIME_RENDER_OFFLOAD_PROVIDER __VK_LAYER_NV_optimus
+export DRI_PRIME=pci-0000_00_02_0!
 export __GLX_VENDOR_LIBRARY_NAME=mesa
-export __EGL_VENDOR_LIBRARY_FILENAMES="$MESA_EGL_VENDOR"
-export MESA_LOADER_DRIVER_OVERRIDE=iris
 export LIBVA_DRIVER_NAME=iHD
 export VK_LOADER_DRIVERS_SELECT="*intel_icd*"
-export MESA_VK_DEVICE_SELECT="${INTEL_VK_ID}!"
-export MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE=1
 exec /usr/bin/start-hyprland "\$@"
 START_INTEL
 
 # Цветовая тема и конфигурация Hyprland.
 mkdir -p "$CONFIG_ROOT/hypr" "$CONFIG_ROOT/waybar" "$CONFIG_ROOT/wofi" "$CONFIG_ROOT/gtk-3.0" "$STATE_ROOT" "$TARGET_HOME/Pictures/wall"
 write_file "$CONFIG_ROOT/hypr/hyprland.lua" 0644 <<HYPRLUA
+-- Hyprland 0.57+: конфигурация на Lua (старый hyprland.conf больше не используется).
 hl.monitor({ output = "", mode = "preferred", position = "auto", scale = "auto" })
 
 hl.env("XCURSOR_SIZE", "24")
@@ -654,25 +649,24 @@ hl.env("HYPRCURSOR_SIZE", "24")
 hl.env("GTK_THEME", "Adwaita-dark")
 hl.env("QT_QPA_PLATFORMTHEME", "qt6ct")
 hl.env("QT_STYLE_OVERRIDE", "Fusion")
+hl.env("DRI_PRIME", "pci-0000_00_02_0!")
 hl.env("__GLX_VENDOR_LIBRARY_NAME", "mesa")
-hl.env("__EGL_VENDOR_LIBRARY_FILENAMES", "$MESA_EGL_VENDOR")
-hl.env("MESA_LOADER_DRIVER_OVERRIDE", "iris")
 hl.env("LIBVA_DRIVER_NAME", "iHD")
+hl.env("__NV_PRIME_RENDER_OFFLOAD", "0")
+hl.env("__VK_LAYER_NV_optimus", "")
 hl.env("VK_LOADER_DRIVERS_SELECT", "*intel_icd*")
-hl.env("MESA_VK_DEVICE_SELECT", "${INTEL_VK_ID}!")
-hl.env("MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE", "1")
 hl.env("XDG_CURRENT_DESKTOP", "Hyprland")
 hl.env("XDG_SESSION_TYPE", "wayland")
 hl.env("XDG_SESSION_DESKTOP", "Hyprland")
 
 hl.config({
     general = {
-        gaps_in = 6,
+        gaps_in = 14,
         gaps_out = 14,
         border_size = 1,
         col = {
-            active_border = "rgba(85a862ff)",   -- Темно-лаймовый пастельный акцент
-            inactive_border = "rgba(2b3628cc)",
+            active_border = "rgba(a9bb7aff)",
+            inactive_border = "rgba(3b4938cc)",
         },
         layout = "dwindle",
         allow_tearing = false,
@@ -686,43 +680,43 @@ hl.config({
         touchpad = { natural_scroll = true },
     },
     decoration = {
-        rounding = 10,
+        rounding = 7,
         active_opacity = 1.0,
         inactive_opacity = 1.0,
-        blur = { 
-            enabled = true,
-            size = 3,
-            passes = 1,
-        },
+        blur = { enabled = false },
         shadow = { enabled = false },
     },
-    -- Сбалансированные и быстрые анимации
-    animations = {
-        enabled = true,
-        bezier = {
-            name = "balanced",
-            points = { 0.05, 0.9, 0.1, 1.05 },
-        },
-        animation = {
-            "windows, 1, 4, balanced, slide",
-            "windowsOut, 1, 4, balanced, slide",
-            "border, 1, 5, default",
-            "fade, 1, 4, default",
-            "workspaces, 1, 4, balanced, slide",
-        },
-    },
+    animations = { enabled = true },
     dwindle = { preserve_split = true },
     misc = {
         disable_hyprland_logo = true,
     },
 })
 
+hl.curve("easeOutQuint", {
+    type = "bezier",
+    points = { { 0.23, 1.0 }, { 0.32, 1.0 } },
+})
+hl.curve("smooth", {
+    type = "bezier",
+    points = { { 0.25, 0.1 }, { 0.25, 1.0 } },
+})
+
+hl.animation({ leaf = "windows", enabled = true, speed = 2.2, bezier = "easeOutQuint", style = "popin 86%" })
+hl.animation({ leaf = "windowsIn", enabled = true, speed = 2.2, bezier = "easeOutQuint", style = "popin 86%" })
+hl.animation({ leaf = "windowsOut", enabled = true, speed = 1.8, bezier = "smooth", style = "popin 86%" })
+hl.animation({ leaf = "windowsMove", enabled = true, speed = 2.0, bezier = "smooth" })
+hl.animation({ leaf = "fade", enabled = true, speed = 1.8, bezier = "smooth" })
+hl.animation({ leaf = "border", enabled = true, speed = 2.0, bezier = "smooth" })
+hl.animation({ leaf = "workspaces", enabled = true, speed = 2.4, bezier = "easeOutQuint", style = "slide" })
+
 local function bind(key, command)
     hl.bind(key, hl.dsp.exec_cmd(command))
 end
 
+-- Автозапуск лёгких компонентов.
 hl.on("hyprland.start", function()
-    hl.exec_cmd("dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE VK_LOADER_DRIVERS_SELECT MESA_VK_DEVICE_SELECT MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE __GLX_VENDOR_LIBRARY_NAME __EGL_VENDOR_LIBRARY_FILENAMES MESA_LOADER_DRIVER_OVERRIDE LIBVA_DRIVER_NAME")
+    hl.exec_cmd("dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE DRI_PRIME VK_LOADER_DRIVERS_SELECT __GLX_VENDOR_LIBRARY_NAME LIBVA_DRIVER_NAME")
     hl.exec_cmd("waybar")
     hl.exec_cmd("mako")
     hl.exec_cmd("/usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1")
@@ -745,6 +739,8 @@ bind("XF86AudioRaiseVolume", "wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 5%+")
 bind("XF86AudioLowerVolume", "wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-")
 bind("XF86AudioMute", "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle")
 bind("XF86AudioMicMute", "wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle")
+-- Fn+F6/F7/F8: мультимедийные клавиши ноутбука через MPRIS/playerctl.
+-- Fn обычно обрабатывается прошивкой и отправляет XF86Audio* без отдельного модификатора.
 bind("XF86AudioPrev", "playerctl previous")
 bind("XF86AudioPlay", "playerctl play-pause")
 bind("XF86AudioNext", "playerctl next")
@@ -771,146 +767,108 @@ write_file "$CONFIG_ROOT/waybar/config.jsonc" 0644 <<'WAYBAR'
   "layer": "top",
   "position": "top",
   "height": 32,
-  "spacing": 6,
-  "modules-left": ["hyprland/workspaces"],
+  "spacing": 4,
+  "modules-left": ["custom/launcher", "hyprland/workspaces"],
   "modules-center": ["clock"],
   "modules-right": ["hyprland/language", "pulseaudio", "backlight", "battery", "custom/performance"],
-  
+  "custom/launcher": {
+    "format": "◈",
+    "tooltip": true,
+    "tooltip-format": "Приложения",
+    "on-click": "/usr/local/bin/hypr-launcher"
+  },
   "hyprland/workspaces": {
     "format": "{name}",
     "on-click": "activate",
     "all-outputs": true,
     "disable-scroll": true,
     "persistent-workspaces": {
-      "1": [],
-      "2": [],
-      "3": [],
-      "4": [],
-      "5": []
+      "*": 5
     }
   },
-  
   "clock": {
-    "format": "  {:%H:%M}",
-    "format-alt": "  {:%a %d %b  %H:%M}",
-    "tooltip": false,
-    "on-click": "gsimplecal"
+    "format": "󰥔  {:%H:%M  ·  %a %d %b}",
+    "tooltip": true,
+    "tooltip-format": "<tt><small>{calendar}</small></tt>",
+    "calendar": {
+      "mode": "month",
+      "mode-mon-col": 3,
+      "weeks-pos": "right",
+      "on-scroll": 1,
+      "format": {
+        "months": "<span color='#b5c98a'><b>{}</b></span>",
+        "days": "<span color='#e1e7df'>{}</span>",
+        "weeks": "<span color='#7d9460'>W{}</span>",
+        "weekdays": "<span color='#a9bb7a'><b>{}</b></span>",
+        "today": "<span color='#b5c98a'><b><u>{}</u></b></span>"
+      }
+    },
+    "actions": {
+      "on-click": "mode",
+      "on-click-right": "shift_reset",
+      "on-scroll-up": "shift_up",
+      "on-scroll-down": "shift_down"
+    }
   },
-  
   "hyprland/language": {
-    "format": "  {short}",
-    "tooltip": false
+    "format": "  {short}",
+    "tooltip": true
   },
-  
   "pulseaudio": {
     "format": "{icon}  {volume}%",
-    "format-muted": "  muted",
-    "format-icons": ["", "", ""],
+    "format-muted": "󰖁  0%",
+    "format-icons": {
+      "default": ["", "", ""]
+    },
+    "scroll-step": 5,
+    "max-volume": 100,
     "on-click": "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle",
     "on-scroll-up": "wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 5%+",
-    "on-scroll-down": "wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-",
-    "tooltip": false
+    "on-scroll-down": "wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-"
   },
-  
   "backlight": {
-    "format": "  {percent}%",
-    "on-scroll-up": "brightnessctl set +5%",
-    "on-scroll-down": "brightnessctl set 5%-",
-    "tooltip": false
+    "format": "{icon}  {percent}%",
+    "format-icons": ["󰃞", "󰃟", "󰃠"],
+    "on-scroll-up": "brightnessctl set 5%+",
+    "on-scroll-down": "brightnessctl set 5%-"
   },
-  
   "battery": {
     "format": "{icon}  {capacity}%",
-    "format-icons": ["", "", "", "", ""],
+    "format-charging": "󰂄  {capacity}%",
+    "format-plugged": "󰚥  {capacity}%",
+    "format-icons": ["󰂎", "󰁺", "󰁻", "󰁼", "󰁽", "󰁾", "󰁿", "󰂀", "󰂁", "󰂂", "󰁹"],
     "states": {
       "warning": 25,
       "critical": 10
-    },
-    "tooltip": false
+    }
   },
-  
   "custom/performance": {
-    "format": "",
-    "tooltip": "Профиль питания",
+    "format": "󱐋",
+    "tooltip": true,
+    "tooltip-format": "Профиль питания",
     "on-click": "/usr/local/bin/performance-menu"
   }
 }
 WAYBAR
 write_file "$CONFIG_ROOT/waybar/style.css" 0644 <<'WAYCSS'
-* {
-  font-family: "JetBrainsMono Nerd Font", "Symbols Nerd Font", "DejaVu Sans", sans-serif;
-  font-size: 12px;
-  border: none;
-  min-height: 0;
-}
-
-window#waybar {
-  background: rgba(15, 20, 16, 0.90);
-  color: #e4ebe2;
-  border-bottom: 1px solid rgba(85, 120, 75, 0.3);
-}
-
-/* Воркспейсы слева */
-#workspaces button {
-  color: #a8b8a0;
-  background: transparent;
-  padding: 0 8px;
-  margin: 4px 2px;
-  border-radius: 6px;
-  font-weight: 500;
-}
-
-#workspaces button.active {
-  color: #ffffff;
-  background: #6e944f; /* Пастельно-лаймовый акцент */
-}
-
-#workspaces button:hover {
-  background: #4a6634;
-  color: #f0f4e9;
-}
-
-/* Центр: Часы */
-#clock {
-  color: #d2e0cc;
-  font-weight: 600;
-  background: rgba(40, 54, 42, 0.5);
-  padding: 0 12px;
-  margin: 4px 0;
-  border-radius: 8px;
-}
-
-/* Правая сторона: иконки и модули */
-#language,
-#pulseaudio,
-#backlight,
-#battery,
-#custom-performance {
-  color: #c0d1b5;
-  background: rgba(30, 41, 32, 0.4);
-  padding: 0 10px;
-  margin: 4px 2px;
-  border-radius: 6px;
-}
-
-#custom-performance {
-  color: #a9cc82;
-  padding-right: 12px;
-}
-
-#battery.warning {
-  color: #d8b76c;
-}
-
-#battery.critical {
-  color: #d98b7d;
-}
-
-tooltip {
-  background: #151d17;
-  border: 1px solid #526447;
-  color: #e4ebe2;
-}
+* { font-family: "JetBrainsMono Nerd Font", "Symbols Nerd Font", "DejaVu Sans", sans-serif; font-size: 11.5px; border: none; min-height: 0; }
+window#waybar { background: rgba(20, 26, 20, 0.94); color: #e1e7df; border-bottom: 1px solid #3b4938; }
+#custom-launcher { color: #a9bb7a; background: transparent; padding: 0 10px 0 12px; margin: 4px 2px; border-radius: 6px; font-size: 13px; }
+#custom-launcher:hover { background: #263125; color: #b5c98a; }
+#workspaces button { color: #a0aa9d; background: transparent; padding: 0 9px; margin: 4px 2px; border-radius: 6px; transition: all 0.2s ease; }
+#workspaces button.active { background: #a9bb7a; color: #141a14; font-weight: 700; }
+#workspaces button:hover { background: #263125; color: #e1e7df; }
+#workspaces button.urgent { background: #d98b7d; color: #141a14; font-weight: 700; }
+#clock { color: #e1e7df; font-size: 13.5px; font-weight: 700; padding: 0 14px; letter-spacing: 0.2px; }
+#language, #pulseaudio, #backlight, #battery, #custom-performance { background: #1a211b; color: #e1e7df; border: 1px solid #3b4938; border-radius: 6px; padding: 0 9px; margin: 4px 2px; }
+#language { color: #d7dfcf; }
+#pulseaudio.muted { color: #a0aa9d; }
+#battery.warning { color: #d8b76c; border-color: #6c5d39; }
+#battery.critical { color: #d98b7d; border-color: #6e3f38; }
+#custom-performance { color: #b5c98a; padding: 0 10px; margin-right: 8px; }
+#custom-performance:hover, #language:hover, #pulseaudio:hover, #backlight:hover, #battery:hover { background: #263125; border-color: #526447; }
+tooltip { background: #141a14; border: 1px solid #526447; border-radius: 8px; color: #e1e7df; padding: 6px 10px; }
+tooltip label { color: #e1e7df; }
 WAYCSS
 write_file "$CONFIG_ROOT/wofi/config" 0644 <<'WOFI'
 width=540
@@ -924,11 +882,12 @@ insensitive=true
 hide_scroll=true
 WOFI
 write_file "$CONFIG_ROOT/wofi/style.css" 0644 <<'WOFICSS'
-window { background: #111512; color: #e1e7df; border: 1px solid #526447; border-radius: 10px; font-family: "DejaVu Sans"; }
+window { background: #141a14; color: #e1e7df; border: 1px solid #526447; border-radius: 10px; font-family: "DejaVu Sans"; }
 #input { background: #1a211b; color: #e1e7df; border: 1px solid #526447; border-radius: 7px; margin: 8px; padding: 8px; }
-#entry { padding: 7px; }
-#entry:selected { background: #405238; color: #fff; border-radius: 6px; }
+#entry { padding: 7px; border-radius: 6px; }
+#entry:selected { background: #a9bb7a; color: #141a14; border-radius: 6px; }
 #text { color: #e1e7df; }
+#text:selected { color: #141a14; font-weight: bold; }
 WOFICSS
 write_file "$CONFIG_ROOT/alacritty/alacritty.toml" 0644 <<'ALACRITTY'
 [window]
@@ -941,28 +900,32 @@ size = 10.5
 normal = { family = "DejaVu Sans Mono" }
 
 [colors.primary]
-background = "#111512"
+background = "#141a14"
 foreground = "#e1e7df"
 
+[colors.cursor]
+text = "#141a14"
+cursor = "#b5c98a"
+
 [colors.normal]
-black = "#171e18"
+black = "#1a211b"
 red = "#bd766b"
-green = "#879b60"
+green = "#7d9460"
 yellow = "#b7a36a"
 blue = "#778b72"
 magenta = "#9a829a"
 cyan = "#78978f"
-white = "#d2d9ce"
+white = "#d7dfcf"
 
 [colors.bright]
-black = "#687267"
+black = "#526447"
 red = "#d28b7f"
-green = "#a9bb7a"
+green = "#b5c98a"
 yellow = "#d1bd82"
 blue = "#9aab91"
 magenta = "#b29ab2"
 cyan = "#9ab9ae"
-white = "#f0f4e9"
+white = "#e1e7df"
 ALACRITTY
 write_file "$CONFIG_ROOT/gtk-3.0/settings.ini" 0644 <<'GTK'
 [Settings]
@@ -974,9 +937,9 @@ GTK
 mkdir -p "$CONFIG_ROOT/qt6ct/colors"
 write_file "$CONFIG_ROOT/qt6ct/colors/olive.conf" 0644 <<'QTCOLORS'
 [ColorScheme]
-active_colors=#ffe1e7df, #ff202a21, #ff35452f, #ff526447, #ff0b0f0c, #ff2a332a, #ffe1e7df, #ffffffff, #ffe1e7df, #ff111512, #ff111512, #ff000000, #ff46583b, #fff0f4e9, #ffa9bb7a, #ff879b60, #ff171e18, #ffe1e7df, #ff171e18, #ffe1e7df, #ff8b9689, #ff71834b
-inactive_colors=#ffe1e7df, #ff202a21, #ff35452f, #ff526447, #ff0b0f0c, #ff2a332a, #ffe1e7df, #ffffffff, #ffe1e7df, #ff111512, #ff111512, #ff000000, #ff405238, #fff0f4e9, #ffa9bb7a, #ff879b60, #ff171e18, #ffe1e7df, #ff171e18, #ffe1e7df, #ff8b9689, #ff71834b
-disabled_colors=#ff7c887a, #ff1a211b, #ff293329, #ff3b4938, #ff0b0f0c, #ff202820, #ff7c887a, #ffb8c0b5, #ff7c887a, #ff111512, #ff111512, #ff000000, #ff35452f, #ffb8c0b5, #ff75865a, #ff687b58, #ff171e18, #ff7c887a, #ff171e18, #ff7c887a, #ff657064, #ff526447
+active_colors=#ffe1e7df, #ff1a211b, #ff3b4938, #ff526447, #ff0d120d, #ff283328, #ffe1e7df, #fff0f4e9, #ffe1e7df, #ff141a14, #ff141a14, #ff0a0d0a, #ff7d9460, #ff141a14, #ffb5c98a, #ff8ba46b, #ff1a211b, #ffe1e7df, #ff1a211b, #ffe1e7df, #ffa0aa9d, #ffa9bb7a
+inactive_colors=#ffe1e7df, #ff1a211b, #ff3b4938, #ff526447, #ff0d120d, #ff283328, #ffe1e7df, #fff0f4e9, #ffe1e7df, #ff141a14, #ff141a14, #ff0a0d0a, #ff526447, #ffe1e7df, #ffa9bb7a, #ff7d9460, #ff1a211b, #ffe1e7df, #ff1a211b, #ffe1e7df, #ffa0aa9d, #ff8ba46b
+disabled_colors=#ff7c887a, #ff1a211b, #ff293329, #ff3b4938, #ff0d120d, #ff202820, #ff7c887a, #ffb8c0b5, #ff7c887a, #ff141a14, #ff141a14, #ff0a0d0a, #ff35452f, #ffb8c0b5, #ff75865a, #ff687b58, #ff1a211b, #ff7c887a, #ff1a211b, #ff7c887a, #ff657064, #ff526447
 QTCOLORS
 write_file "$CONFIG_ROOT/qt6ct/qt6ct.conf" 0644 <<QTCONF
 [Appearance]
@@ -988,9 +951,9 @@ standard_dialogs=default
 QTCONF
 write_file "$CONFIG_ROOT/mako/config" 0644 <<'MAKO'
 font=DejaVu Sans 10
-background-color=#171e18
+background-color=#1a211b
 text-color=#e1e7df
-border-color=#71834b
+border-color=#a9bb7a
 border-size=1
 border-radius=8
 padding=10
@@ -1007,12 +970,12 @@ bars = 0
 method = ncurses
 
 [colors]
-foreground = '#a9bb7a'
+foreground = '#b5c98a'
 gradient = 1
 gradient_color_1 = '#526447'
-gradient_color_2 = '#71834b'
-gradient_color_3 = '#879b60'
-gradient_color_4 = '#a9bb7a'
+gradient_color_2 = '#7d9460'
+gradient_color_3 = '#a9bb7a'
+gradient_color_4 = '#b5c98a'
 CAVA
 
 # MIME: Files — файловый менеджер; пакетные архивы — безопасный обработчик с подтверждением.
@@ -1105,13 +1068,11 @@ install_appimage() {
   chmod 0755 "$dir/$name.AppImage"
   cat > "$BIN_ROOT/$name" <<EOF
 #!/usr/bin/env bash
+unset __NV_PRIME_RENDER_OFFLOAD __NV_PRIME_RENDER_OFFLOAD_PROVIDER __VK_LAYER_NV_optimus
+export DRI_PRIME=pci-0000_00_02_0!
 export __GLX_VENDOR_LIBRARY_NAME=mesa
-export __EGL_VENDOR_LIBRARY_FILENAMES="$MESA_EGL_VENDOR"
-export MESA_LOADER_DRIVER_OVERRIDE=iris
 export LIBVA_DRIVER_NAME=iHD
 export VK_LOADER_DRIVERS_SELECT="*intel_icd*"
-export MESA_VK_DEVICE_SELECT="${INTEL_VK_ID}!"
-export MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE=1
 exec "$dir/$name.AppImage" --appimage-extract-and-run "\$@"
 EOF
   chmod 0755 "$BIN_ROOT/$name"
@@ -1147,13 +1108,9 @@ if fetch_file "$ONLYOFFICE_URL" "$APP_ROOT/onlyoffice/onlyoffice.AppImage" "" el
   chmod 0755 "$APP_ROOT/onlyoffice/onlyoffice.AppImage"
   cat > "$BIN_ROOT/onlyoffice" <<EOF
 #!/usr/bin/env bash
-export __GLX_VENDOR_LIBRARY_NAME=mesa
-export __EGL_VENDOR_LIBRARY_FILENAMES="$MESA_EGL_VENDOR"
-export MESA_LOADER_DRIVER_OVERRIDE=iris
-export LIBVA_DRIVER_NAME=iHD
+unset __NV_PRIME_RENDER_OFFLOAD __NV_PRIME_RENDER_OFFLOAD_PROVIDER __VK_LAYER_NV_optimus
+export DRI_PRIME=pci-0000_00_02_0! __GLX_VENDOR_LIBRARY_NAME=mesa LIBVA_DRIVER_NAME=iHD
 export VK_LOADER_DRIVERS_SELECT="*intel_icd*"
-export MESA_VK_DEVICE_SELECT="${INTEL_VK_ID}!"
-export MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE=1
 exec "$APP_ROOT/onlyoffice/onlyoffice.AppImage" --appimage-extract-and-run "\$@"
 EOF
   chmod 0755 "$BIN_ROOT/onlyoffice"
@@ -1225,16 +1182,13 @@ for desktop_id, src in all_entries.items():
 WOFI_CURATE
 chown -R "$TARGET_USER:$TARGET_GROUP" "$WOFI_HIDE_DIR"
 
-# Жёсткая фиксация Intel UHD и Intel Vulkan ICD (включая 32-битные приложения Steam) для всей сессии.
+# Steam должен использовать Intel ICD, включая 32-битный Vulkan.
+# Для приложений в пользовательской сессии экспортируем только выбор Intel, не добавляя PRIME-переключение.
 write_file "$CONFIG_ROOT/environment.d/90-intel-gpu.conf" 0644 <<ENV
-AQ_DRM_DEVICES=$INTEL_DRM_CARD
+DRI_PRIME=pci-0000_00_02_0!
 __GLX_VENDOR_LIBRARY_NAME=mesa
-__EGL_VENDOR_LIBRARY_FILENAMES=$MESA_EGL_VENDOR
-MESA_LOADER_DRIVER_OVERRIDE=iris
 LIBVA_DRIVER_NAME=iHD
 VK_LOADER_DRIVERS_SELECT=*intel_icd*
-MESA_VK_DEVICE_SELECT=${INTEL_VK_ID}!
-MESA_VK_DEVICE_SELECT_FORCE_DEFAULT_DEVICE=1
 QT_QPA_PLATFORMTHEME=qt6ct
 QT_STYLE_OVERRIDE=Fusion
 ENV
@@ -1264,6 +1218,9 @@ ZPROFILE
 
 # HYPR_MINIMAL_TTY1: запуск только в первой локальной консоли.
 if [[ -z "${WAYLAND_DISPLAY:-}" && -z "${DISPLAY:-}" && "${XDG_VTNR:-0}" == "1" && -t 0 ]]; then
+    export DRI_PRIME=pci-0000_00_02_0!
+    export __GLX_VENDOR_LIBRARY_NAME=mesa
+    export VK_LOADER_DRIVERS_SELECT="*intel_icd*"
     exec /usr/local/bin/start-hyprland-intel
 fi
 LOGIN_PROFILE
@@ -1312,21 +1269,37 @@ install -d -o "$TARGET_USER" -g "$TARGET_GROUP" "$TARGET_HOME/.local/state/hypr-
 
 # Статическая проверка синтаксиса файлов, которые можно проверить без графической сессии.
 log "Проверка созданных файлов"
-for f in "$BIN_ROOT/arch-package-install" "$BIN_ROOT/files" "$BIN_ROOT/power-menu" "$BIN_ROOT/performance-menu" "$BIN_ROOT/hypr-wallpaper-next" "$BIN_ROOT/hypr-restore-profile" "$BIN_ROOT/hypr-launcher" "$BIN_ROOT/start-hyprland-intel"; do bash -n "$f"; done
+for f in "$BIN_ROOT/arch-package-install" "$BIN_ROOT/files" "$BIN_ROOT/power-menu" "$BIN_ROOT/performance-menu" "$BIN_ROOT/hypr-wallpaper-next" "$BIN_ROOT/hypr-restore-profile" "$BIN_ROOT/hypr-launcher"; do bash -n "$f"; done
 python -m py_compile "$LIB_ROOT/files.py" "$LIB_ROOT/menu.py" "$LIB_ROOT/github-asset.py"
 python -m json.tool "$CONFIG_ROOT/waybar/config.jsonc" >/dev/null
+# Hyprland --verify-config поддерживается текущими сборками; проверяем, если установленный бинарник это умеет.
 if command -v luac >/dev/null 2>&1; then
   luac -p "$CONFIG_ROOT/hypr/hyprland.lua"
 else
   warn "luac не найден; Lua-конфигурация не прошла локальную синтаксическую проверку."
 fi
 
-log "Проверка графического контроллера Intel UHD"
-if command -v lspci >/dev/null 2>&1; then
-  lspci -nnk -s 00:02.0 || true
+# Проверяем наличие дискретного GPU и драйверных пакетов. Ничего не удаляем и не меняем вслепую.
+log "Аудит NVIDIA (без удаления драйверов и без опасного отключения PCIe)"
+if pacman -Qq 2>/dev/null | grep -Ei '^(nvidia|nvidia-open|nvidia-utils|lib32-nvidia|opencl-nvidia|cuda|bumblebee|optimus-manager)'; then
+  warn "Обнаружены NVIDIA/CUDA/Optimus-пакеты. Они не удаляются; выбор GPU для сеанса ограничен Intel."
+else
+  log "Пакеты NVIDIA/CUDA/Optimus в pacman не обнаружены."
 fi
-log "Intel UHD подтверждена: $INTEL_DRM_CARD → $INTEL_CARD_REAL ($INTEL_VK_ID)"
-log "AQ_DRM_DEVICES закреплён на $INTEL_DRM_CARD; Vulkan/GLX/EGL/VA-API настроены исключительно на Intel ($INTEL_ICD)"
+# Останавливаем только фоновые NVIDIA-службы, которые не нужны для Intel-сеанса.
+for svc in nvidia-persistenced.service nvidia-powerd.service; do
+  if systemctl is-active --quiet "$svc" || systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+    systemctl disable --now "$svc" || warn "Не удалось остановить $svc; проверь вручную."
+  fi
+done
+if lsmod | grep -qE '^(nvidia|nouveau)'; then
+  warn "Модуль NVIDIA/nouveau уже загружен. Скрипт не выгружает его вслепую; проверь вывод lsmod и перезагрузи после настройки."
+fi
+if command -v lspci >/dev/null 2>&1; then
+  lspci -nnk | grep -A3 -Ei 'VGA compatible controller|3D controller|Display controller' || true
+fi
+log "Intel UHD подтверждена по PCI vendor ID 0x8086: $INTEL_DRM_CARD → $INTEL_CARD_REAL"
+log "AQ_DRM_DEVICES будет установлен до запуска Hyprland; Vulkan loader отфильтрован до Intel ICD (включая 32-битные приложения)"
 
 cat <<EOF
 
@@ -1335,10 +1308,11 @@ cat <<EOF
 Дальше:
   1. Перезагрузи ноутбук или выйди и войди в TTY1.
   2. Добавь обои в ~/Pictures/wall.
-  3. Проверь Intel UHD: glxinfo -B (пакет mesa-utils при необходимости),
+  3. Проверь GPU: lspci -k, glxinfo -B (пакет mesa-utils при необходимости),
      vulkaninfo --summary (пакет vulkan-tools при необходимости).
   4. Проверь профили: powerprofilesctl get и powerprofilesctl list.
 
 Резервные копии: $BACKUP_ROOT
-Композитор и пользовательская сессия жёстко привязаны только к Intel UHD Graphics ($INTEL_DRM_CARD и $INTEL_ICD).
+NVIDIA-пакеты не удалялись. Hyprland стартует с AQ_DRM_DEVICES, указывающим только на подтверждённый Intel DRM node; приложения используют Intel PCI ID и Intel Vulkan ICD.
+Это программное ограничение, а не аппаратное отключение GTX 1650.
 EOF
