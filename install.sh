@@ -1,5 +1,5 @@
 #!/bin/bash
-# install.sh - Arch + Hyprland: минимальная установка, сине-голубая тема
+# install.sh - Arch + Hyprland: минимальная установка, пастельно-оливковая тема
 # Запуск: su -   затем   bash install.sh [ИМЯ_ПОЛЬЗОВАТЕЛЯ]
 set -euo pipefail
 [ "$(id -u)" -eq 0 ] || { echo "Запусти от root: su -"; exit 1; }
@@ -27,7 +27,7 @@ pacman -S --noconfirm --needed \
   pipewire pipewire-pulse wireplumber \
   brightnessctl grim slurp wl-clipboard \
   ttf-dejavu ttf-font-awesome noto-fonts-emoji papirus-icon-theme adwaita-icon-theme lxqt-policykit ttf-jetbrains-mono-nerd ttf-nerd-fonts-symbols \
-  python-gobject gtk3 mesa vulkan-intel udisks2 xdg-utils xdg-user-dirs \
+  python-gobject gtk3 mesa vulkan-intel power-profiles-daemon udisks2 xdg-utils xdg-user-dirs \
   fastfetch chafa cava nano curl \
   firefox firefox-i18n-ru telegram-desktop \
   jre21-openjdk prismlauncher
@@ -40,6 +40,35 @@ usermod -aG wheel,video "$U"
 printf '%%wheel ALL=(ALL:ALL) ALL\n' > /etc/sudoers.d/10-wheel
 chmod 440 /etc/sudoers.d/10-wheel
 visudo -cf /etc/sudoers.d/10-wheel >/dev/null || rm -f /etc/sudoers.d/10-wheel
+
+# ================= NVIDIA: отключена полностью, работает только Intel =================
+# 1) драйверы (nouveau/nvidia) не загружаются никогда
+cat > /etc/modprobe.d/disable-nvidia.conf <<'NVEOF'
+blacklist nouveau
+blacklist nvidia
+blacklist nvidia_drm
+blacklist nvidia_modeset
+blacklist nvidia_uvm
+blacklist nvidiafb
+blacklist i2c_nvidia_gpu
+install nouveau /bin/false
+options nouveau modeset=0
+NVEOF
+# 2) при загрузке ядро "забывает" само PCI-устройство NVIDIA: карта не видна системе и не питается
+cat > /etc/udev/rules.d/00-remove-nvidia.rules <<'NVEOF'
+# NVIDIA USB xHCI / Type-C UCSI / Audio / VGA-3D: удалить из системы
+ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{class}=="0x0c0330", ATTR{power/control}="auto", ATTR{remove}="1"
+ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{class}=="0x0c8000", ATTR{power/control}="auto", ATTR{remove}="1"
+ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{class}=="0x040300", ATTR{power/control}="auto", ATTR{remove}="1"
+ACTION=="add", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{class}=="0x03[0-9]*", ATTR{power/control}="auto", ATTR{remove}="1"
+NVEOF
+udevadm control --reload 2>/dev/null || true
+# 3) чтобы nouveau не попал в initramfs
+if command -v mkinitcpio >/dev/null 2>&1; then mkinitcpio -P || echo "!! mkinitcpio вернул ошибку (проверь вручную)"; fi
+
+# профили питания (меню производительности)
+systemctl enable power-profiles-daemon.service >/dev/null 2>&1 || echo "!! не удалось включить power-profiles-daemon"
+systemctl start power-profiles-daemon.service >/dev/null 2>&1 || true
 
 # ================= системные утилиты =================
 cat > /usr/local/bin/pkg-install <<'EOF2'
@@ -64,6 +93,11 @@ fi
 exec wofi --show drun
 EOF
 chmod 755 /usr/local/bin/launcher.sh
+cat > /usr/local/bin/hypr-launcher <<'EOF'
+#!/bin/sh
+exec /usr/local/bin/launcher.sh
+EOF
+chmod 755 /usr/local/bin/hypr-launcher
 
 # ---------- файловый менеджер Files ----------
 cat > /usr/local/bin/files <<'EOF'
@@ -94,42 +128,42 @@ DND = [Gtk.TargetEntry.new("text/uri-list", 0, 0)]
 ACT_COPY, ACT_MOVE = Gdk.DragAction.COPY, Gdk.DragAction.MOVE
 CSS = b"""
 * { font-family: "DejaVu Sans Mono", monospace; font-size: 11px; }
-window { background-color: rgba(13,17,27,0.82); color: #cdd6f4; }
-window.dialog, window.messagedialog { background-color: rgb(17,22,34); }
+window { background-color: rgba(15,20,16,0.82); color: #e4ebe2; }
+window.dialog, window.messagedialog { background-color: rgb(20,27,22); }
 .bar { padding: 8px 10px 4px 10px; }
-button { background-image: none; background-color: rgba(137,180,250,0.06); color: #cdd6f4;
-border: 1px solid rgba(137,180,250,0.25); border-radius: 14px; box-shadow: none;
+button { background-image: none; background-color: rgba(169,204,130,0.06); color: #e4ebe2;
+border: 1px solid rgba(169,204,130,0.25); border-radius: 14px; box-shadow: none;
 padding: 2px 10px; min-height: 0; min-width: 0; }
-button:hover { background-color: rgba(137,180,250,0.16); }
-button:checked { background-color: rgba(137,180,250,0.30); }
-entry { background-image: none; background-color: rgba(137,180,250,0.06); color: #cdd6f4;
-border: 1px solid rgba(137,180,250,0.25); border-radius: 14px; box-shadow: none;
+button:hover { background-color: rgba(169,204,130,0.16); }
+button:checked { background-color: rgba(169,204,130,0.30); }
+entry { background-image: none; background-color: rgba(169,204,130,0.06); color: #e4ebe2;
+border: 1px solid rgba(169,204,130,0.25); border-radius: 14px; box-shadow: none;
 padding: 2px 12px; min-height: 0; }
-entry:focus { border-color: #89b4fa; }
-.side { background-color: rgba(137,180,250,0.04); border-right: 1px solid rgba(137,180,250,0.15); }
+entry:focus { border-color: #a9cc82; }
+.side { background-color: rgba(169,204,130,0.04); border-right: 1px solid rgba(169,204,130,0.15); }
 .side row { padding: 5px 10px; margin: 1px 8px; border-radius: 10px; background: transparent; }
-.side row:hover { background-color: rgba(137,180,250,0.10); }
-.side row:selected { background-color: rgba(137,180,250,0.25); color: #ffffff; }
-.side row:drop(active) { background-color: rgba(137,180,250,0.35); }
-.sect { color: #7f8fae; font-size: 9px; padding: 10px 18px 2px 18px; }
-treeview.view { background-color: transparent; color: #cdd6f4; }
-treeview.view:hover { background-color: rgba(137,180,250,0.08); }
-treeview.view:selected { background-color: rgba(137,180,250,0.28); color: #ffffff; }
-treeview.view:drop(active) { border: 1px solid rgba(137,180,250,0.80); }
-treeview.view.dnd { border: 1px solid rgba(137,180,250,0.80); }
+.side row:hover { background-color: rgba(169,204,130,0.10); }
+.side row:selected { background-color: rgba(169,204,130,0.25); color: #ffffff; }
+.side row:drop(active) { background-color: rgba(169,204,130,0.35); }
+.sect { color: #8a9a82; font-size: 9px; padding: 10px 18px 2px 18px; }
+treeview.view { background-color: transparent; color: #e4ebe2; }
+treeview.view:hover { background-color: rgba(169,204,130,0.08); }
+treeview.view:selected { background-color: rgba(169,204,130,0.28); color: #ffffff; }
+treeview.view:drop(active) { border: 1px solid rgba(169,204,130,0.80); }
+treeview.view.dnd { border: 1px solid rgba(169,204,130,0.80); }
 treeview header button { background-color: transparent; border: none; border-radius: 0;
-border-bottom: 1px solid rgba(137,180,250,0.18); color: #7f8fae; padding: 3px 8px; }
+border-bottom: 1px solid rgba(169,204,130,0.18); color: #8a9a82; padding: 3px 8px; }
 scrolledwindow, viewport { background-color: transparent; }
-scrollbar slider { background-color: rgba(137,180,250,0.35); border-radius: 4px; min-width: 6px; min-height: 6px; }
+scrollbar slider { background-color: rgba(169,204,130,0.35); border-radius: 4px; min-width: 6px; min-height: 6px; }
 scrollbar { background: transparent; border: none; }
-.status { color: #7f8fae; padding: 3px 14px 6px 14px; }
-.err { color: #f38ba8; }
-.dim { color: #7f8fae; }
-menu, .menu { background-color: rgb(17,22,34); color: #cdd6f4; border: 1px solid rgba(137,180,250,0.30);
+.status { color: #8a9a82; padding: 3px 14px 6px 14px; }
+.err { color: #d98b7d; }
+.dim { color: #8a9a82; }
+menu, .menu { background-color: rgb(20,27,22); color: #e4ebe2; border: 1px solid rgba(169,204,130,0.30);
 border-radius: 8px; padding: 4px; }
 menuitem { padding: 4px 10px; border-radius: 6px; }
-menuitem:hover { background-color: rgba(137,180,250,0.18); }
-separator { background-color: rgba(137,180,250,0.15); min-height: 1px; }
+menuitem:hover { background-color: rgba(169,204,130,0.18); }
+separator { background-color: rgba(169,204,130,0.15); min-height: 1px; }
 """
 PLACES = [
     ("user-home-symbolic", "Домашняя папка", HOME),
@@ -480,7 +514,7 @@ class FilesWindow(Gtk.Window):
     def text_column(self, title, idx, key):
         r = Gtk.CellRendererText()
         r.set_property("xalign", 1.0)
-        r.set_property("foreground", "#8fa3c4")
+        r.set_property("foreground", "#a8b8a0")
         col = Gtk.TreeViewColumn(title, r, text=idx)
         col.set_min_width(110)
         col.set_clickable(True)
@@ -1311,18 +1345,18 @@ from gi.repository import Gdk, GLib, Gtk
 LOCK = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "power-menu.pid")
 CSS = b"""
 * { font-family: "DejaVu Sans Mono", "FontAwesome", monospace; }
-window { background-color: rgba(5,8,14,0.60); }
-.card { background-color: rgba(13,17,27,0.85); border: 1px solid rgba(137,180,250,0.45);
+window { background-color: rgba(4,7,5,0.60); }
+.card { background-color: rgba(15,20,16,0.85); border: 1px solid rgba(169,204,130,0.45);
 border-radius: 20px; padding: 22px 24px 14px 24px; }
-button { background-image: none; background-color: rgba(137,180,250,0.06); color: #cdd6f4;
-border: 1px solid rgba(137,180,250,0.25); border-radius: 16px; box-shadow: none; padding: 0; }
-button:hover, button:focus { background-color: rgba(137,180,250,0.18); border-color: #89b4fa; }
-button.danger { color: #f38ba8; border-color: rgba(243,139,168,0.45); }
-button.danger:hover, button.danger:focus { background-color: rgba(243,139,168,0.20); border-color: #f38ba8; }
+button { background-image: none; background-color: rgba(169,204,130,0.06); color: #e4ebe2;
+border: 1px solid rgba(169,204,130,0.25); border-radius: 16px; box-shadow: none; padding: 0; }
+button:hover, button:focus { background-color: rgba(169,204,130,0.18); border-color: #a9cc82; }
+button.danger { color: #d98b7d; border-color: rgba(217,139,125,0.45); }
+button.danger:hover, button.danger:focus { background-color: rgba(217,139,125,0.20); border-color: #d98b7d; }
 .icon { font-size: 30px; }
 .name { font-size: 11px; }
-.key { color: #7f8fae; font-size: 9px; }
-.hint { color: #6b7a96; font-size: 9px; }
+.key { color: #8a9a82; font-size: 9px; }
+.hint { color: #75846d; font-size: 9px; }
 """
 
 ITEMS = (
@@ -1487,6 +1521,266 @@ if __name__ == "__main__":
 EOF
 chmod 755 /usr/local/bin/power-menu
 
+# ---------- меню производительности (профили питания) ----------
+cat > /usr/local/bin/performance-menu <<'EOF'
+#!/usr/bin/python3
+import os
+import re
+import subprocess
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, GLib, Gtk
+
+LOCK = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "performance-menu.pid")
+CSS = b"""
+* { font-family: "DejaVu Sans Mono", "FontAwesome", monospace; }
+window { background-color: rgba(4,7,5,0.60); }
+.card { background-color: rgba(15,20,16,0.88); border: 1px solid rgba(169,204,130,0.45);
+border-radius: 20px; padding: 22px 24px 14px 24px; }
+.title { color: #e4ebe2; font-size: 14px; }
+.sub { color: #8a9a82; font-size: 10px; }
+button { background-image: none; background-color: rgba(169,204,130,0.06); color: #e4ebe2;
+border: 1px solid rgba(169,204,130,0.25); border-radius: 16px; box-shadow: none; padding: 0; }
+button:hover, button:focus { background-color: rgba(169,204,130,0.18); border-color: #a9cc82; }
+button.active { background-color: rgba(110,148,79,0.35); border-color: #a9cc82; }
+button:disabled { opacity: 0.35; }
+.icon { font-size: 30px; color: #a9cc82; }
+button.perf .icon { color: #d8b76c; }
+.name { font-size: 12px; }
+.desc { color: #8a9a82; font-size: 9px; }
+.key { color: #75846d; font-size: 9px; }
+.err { color: #d98b7d; font-size: 10px; }
+.hint { color: #75846d; font-size: 9px; }
+"""
+
+PROFILES = (
+    ("power-saver", "\uf06c", "Энергосбережение", "тише и дольше от батареи", "1", False),
+    ("balanced", "\uf24e", "Баланс", "на каждый день", "2", False),
+    ("performance", "\uf0e7", "Производительность", "максимум мощности", "3", True),
+)
+
+
+def ppd(*args):
+    return subprocess.run(["powerprofilesctl", *args], capture_output=True, text=True, timeout=5)
+
+
+def state():
+    # (текущий профиль, множество доступных профилей); при сбое (None, пусто)
+    try:
+        cur = ppd("get")
+        lst = ppd("list")
+        if cur.returncode != 0 or lst.returncode != 0:
+            return None, set()
+        names = set(re.findall(r"^\s*\*?\s*([a-z-]+):\s*$", lst.stdout, re.M))
+        return cur.stdout.strip(), names
+    except Exception:
+        return None, set()
+
+
+def running():
+    try:
+        with open(LOCK) as f:
+            pid = int(f.read().strip())
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return pid if b"performance-menu" in f.read() else 0
+    except Exception:
+        return 0
+
+
+def drop_lock():
+    try:
+        os.remove(LOCK)
+    except OSError:
+        pass
+
+
+class PerfMenu(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="performance-menu")
+        self.set_decorated(False)
+        screen = self.get_screen()
+        visual = screen.get_rgba_visual()
+        if visual:
+            self.set_visual(visual)
+        for rule in re.findall(rb"[^{}]+\{[^{}]*\}", CSS):
+            prov = Gtk.CssProvider()
+            try:
+                prov.load_from_data(rule)
+            except GLib.Error:
+                continue
+            Gtk.StyleContext.add_provider_for_screen(screen, prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        cur, avail = state()
+        bg = Gtk.EventBox()
+        bg.set_visible_window(False)
+        bg.connect("button-press-event", lambda w, e: self.quit())
+        hold = Gtk.EventBox()
+        hold.set_visible_window(False)
+        hold.set_halign(Gtk.Align.CENTER)
+        hold.set_valign(Gtk.Align.CENTER)
+        hold.connect("button-press-event", lambda w, e: True)
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        card.get_style_context().add_class("card")
+        title = Gtk.Label(label="Профиль питания")
+        title.get_style_context().add_class("title")
+        card.pack_start(title, False, False, 0)
+        self.sub = Gtk.Label(label="")
+        card.pack_start(self.sub, False, False, 0)
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        self.buttons = []
+        self.keys = {}
+        focus = None
+        for prof, icon, name, desc, key, perf in PROFILES:
+            b = Gtk.Button()
+            b.set_size_request(176, 128)
+            ctx = b.get_style_context()
+            if perf:
+                ctx.add_class("perf")
+            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            col.set_valign(Gtk.Align.CENTER)
+            is_cur = prof == cur
+            key_text = key + ("  \u00b7  сейчас" if is_cur else "")
+            for text, cls in ((icon, "icon"), (name, "name"), (desc, "desc"), (key_text, "key")):
+                lab = Gtk.Label(label=text)
+                lab.get_style_context().add_class(cls)
+                col.pack_start(lab, False, False, 0)
+            b.add(col)
+            if is_cur:
+                ctx.add_class("active")
+                focus = b
+            if prof not in avail:
+                b.set_sensitive(False)
+            b.connect("clicked", lambda w, p=prof: self.apply(p))
+            row.pack_start(b, False, False, 0)
+            self.buttons.append((b, prof))
+            if prof in avail:
+                self.keys[key] = prof
+        card.pack_start(row, False, False, 0)
+        if cur is None:
+            self.sub.set_text("служба power-profiles-daemon не отвечает")
+            self.sub.get_style_context().add_class("err")
+        else:
+            self.sub.set_text("выбери режим работы процессора")
+            self.sub.get_style_context().add_class("sub")
+        hint = Gtk.Label(label="← →  выбор    Enter  применить    1 2 3  быстро    Esc  закрыть")
+        hint.get_style_context().add_class("hint")
+        card.pack_start(hint, False, False, 0)
+        hold.add(card)
+        bg.add(hold)
+        self.add(bg)
+        self.connect("key-press-event", self.on_key)
+        self.first = focus
+        if self.first is None:
+            for b, prof in self.buttons:
+                if prof in avail:
+                    self.first = b
+                    break
+        self.fullscreen()
+
+    def live(self):
+        return [b for b, _ in self.buttons if b.get_sensitive()]
+
+    def focus_step(self, d):
+        lst = self.live()
+        if not lst:
+            return
+        cur = self.get_focus()
+        i = lst.index(cur) if cur in lst else -1
+        lst[(i + d) % len(lst)].grab_focus()
+
+    def on_key(self, w, ev):
+        k = Gdk.keyval_name(ev.keyval) or ""
+        if k == "Escape":
+            self.quit()
+        elif k in ("Left", "Up", "ISO_Left_Tab"):
+            self.focus_step(-1)
+        elif k in ("Right", "Down", "Tab"):
+            self.focus_step(1)
+        elif k in self.keys:
+            self.apply(self.keys[k])
+        else:
+            return False
+        return True
+
+    def apply(self, prof):
+        try:
+            r = ppd("set", prof)
+            ok = r.returncode == 0
+        except Exception:
+            ok = False
+        if not ok:
+            ctx = self.sub.get_style_context()
+            ctx.remove_class("sub")
+            ctx.add_class("err")
+            self.sub.set_text("не удалось переключить профиль")
+            return
+        # обновить значок в waybar сразу
+        subprocess.Popen(["pkill", "-RTMIN+8", "waybar"], start_new_session=True)
+        self.quit()
+
+    def quit(self):
+        self.destroy()
+
+
+def on_destroy(*_):
+    drop_lock()
+    Gtk.main_quit()
+
+
+def main():
+    GLib.set_prgname("performance-menu")
+    GLib.set_application_name("performance-menu")
+    pid = running()
+    if pid:
+        try:
+            os.kill(pid, 15)
+        except OSError:
+            pass
+        drop_lock()
+        return
+    w = PerfMenu()
+    w.connect("destroy", on_destroy)
+    w.show_all()
+    try:
+        with open(LOCK, "w") as f:
+            f.write(str(os.getpid()))
+    except OSError:
+        pass
+    if w.first is not None:
+        w.first.grab_focus()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()
+EOF
+chmod 755 /usr/local/bin/performance-menu
+
+cat > /usr/local/bin/performance-status <<'EOF'
+#!/usr/bin/python3
+import json
+import subprocess
+
+INFO = {
+    "power-saver": ("\uf06c", "Энергосбережение"),
+    "balanced": ("\uf24e", "Баланс"),
+    "performance": ("\uf0e7", "Производительность"),
+}
+
+try:
+    cur = subprocess.run(["powerprofilesctl", "get"], capture_output=True, text=True, timeout=3).stdout.strip()
+except Exception:
+    cur = ""
+
+if cur in INFO:
+    icon, name = INFO[cur]
+    out = {"text": icon, "tooltip": "Профиль питания: " + name, "class": cur}
+else:
+    out = {"text": "\uf0e7", "tooltip": "Профиль питания: служба недоступна", "class": "unknown"}
+print(json.dumps(out, ensure_ascii=False))
+EOF
+chmod 755 /usr/local/bin/performance-status
+
 # ================= конфиги пользователя =================
 # w ФАЙЛ - записать stdin в файл (старую версию один раз сохраняет в .bak)
 w() {
@@ -1524,8 +1818,8 @@ hl.config({
     gaps_out = 14,     -- от краёв экрана до окон
     border_size = 1,
     col = {
-      active_border = "rgba(89b4faee)",
-      inactive_border = "rgba(3a4a66aa)",
+      active_border = "rgba(a9cc82ee)",
+      inactive_border = "rgba(3a4a33aa)",
     },
     layout = "dwindle",
   },
@@ -1604,8 +1898,8 @@ decorations = "none"
 opacity = 1.0
 
 [colors.primary]
-background = "#181a26"
-foreground = "#c0caf5"
+background = "#121712"
+foreground = "#dfe8d8"
 
 [font]
 size = 11.0
@@ -1620,77 +1914,121 @@ bar_spacing = 1
 [color]
 gradient = 1
 gradient_count = 4
-gradient_color_1 = '#1e3354'
-gradient_color_2 = '#3f6aa8'
-gradient_color_3 = '#89b4fa'
-gradient_color_4 = '#a6e3f5'
+gradient_color_1 = '#2c3d22'
+gradient_color_2 = '#4a6634'
+gradient_color_3 = '#6e944f'
+gradient_color_4 = '#a9cc82'
 EOF
 
 # ---------- waybar: одна тонкая полоса сверху ----------
 w "$H/.config/waybar/config.jsonc" <<'EOF'
 {
-  "layer": "top", "height": 26, "spacing": 2,
-  "margin-top": 8, "margin-left": 14, "margin-right": 14,
-  "modules-left": ["custom/launcher", "custom/files", "custom/term", "hyprland/workspaces"],
+  "layer": "top",
+  "position": "top",
+  "height": 32,
+  "spacing": 4,
+  "modules-left": ["custom/launcher", "hyprland/workspaces"],
   "modules-center": ["clock"],
-  "modules-right": ["tray", "hyprland/language", "pulseaudio", "pulseaudio#mic", "backlight", "battery", "custom/power"],
-  "custom/launcher": { "format": "\uf002", "tooltip": false, "on-click": "/usr/local/bin/launcher.sh" },
-  "custom/files":    { "format": "\uf07b", "tooltip": false, "on-click": "/usr/local/bin/files" },
-  "custom/term":     { "format": "\uf120", "tooltip": false, "on-click": "alacritty" },
-  "custom/power":    { "format": "\uf011", "tooltip": false, "on-click": "/usr/local/bin/power-menu" },
-  "hyprland/workspaces": { "format": "{id}", "persistent-workspaces": { "*": 5 } },
-  "hyprland/language": { "format": "{short}" },
-  "tray": { "icon-size": 14, "spacing": 6 },
-  "clock": { "format": "{:%H:%M}", "tooltip-format": "{:%A, %d %B %Y}" },
+  "modules-right": ["hyprland/language", "pulseaudio", "backlight", "battery", "custom/performance"],
+  "custom/launcher": {
+    "format": "◈",
+    "tooltip": true,
+    "tooltip-format": "Приложения",
+    "on-click": "/usr/local/bin/hypr-launcher"
+  },
+  "hyprland/workspaces": {
+    "format": "{name}",
+    "on-click": "activate",
+    "all-outputs": true,
+    "disable-scroll": true,
+    "persistent-workspaces": {
+      "*": 5
+    }
+  },
+  "clock": {
+    "format": "󰥔  {:%H:%M  ·  %a %d %b}",
+    "tooltip": true,
+    "tooltip-format": "<tt><small>{calendar}</small></tt>",
+    "calendar": {
+      "mode": "month",
+      "mode-mon-col": 3,
+      "weeks-pos": "right",
+      "on-scroll": 1,
+      "format": {
+        "months": "<span color='#c4dfa0'><b>{}</b></span>",
+        "days": "<span color='#e4ebe2'>{}</span>",
+        "weeks": "<span color='#6e944f'>W{}</span>",
+        "weekdays": "<span color='#a9cc82'><b>{}</b></span>",
+        "today": "<span color='#c4dfa0'><b><u>{}</u></b></span>"
+      }
+    },
+    "actions": {
+      "on-click": "mode",
+      "on-click-right": "shift_reset",
+      "on-scroll-up": "shift_up",
+      "on-scroll-down": "shift_down"
+    }
+  },
+  "hyprland/language": {
+    "format": "  {short}",
+    "tooltip": true
   },
   "pulseaudio": {
-    "format": "\uf028 {volume}%",
-    "format-muted": "\uf6a9",
-    "on-click": "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle"
+    "format": "{icon}  {volume}%",
+    "format-muted": "󰖁  0%",
+    "format-icons": {
+      "default": ["", "", ""]
+    },
+    "scroll-step": 5,
+    "max-volume": 100,
+    "on-click": "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle",
+    "on-scroll-up": "wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 5%+",
+    "on-scroll-down": "wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-"
   },
-  "pulseaudio#mic": {
-    "format": "{format_source}",
-    "format-source": "\uf130",
-    "format-source-muted": "\uf131",
-    "on-click": "wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle"
+  "backlight": {
+    "format": "{icon}  {percent}%",
+    "format-icons": ["󰃞", "󰃟", "󰃠"],
+    "on-scroll-up": "brightnessctl set 5%+",
+    "on-scroll-down": "brightnessctl set 5%-"
   },
-  "backlight": { "format": "\uf185 {percent}%" },
   "battery": {
-    "format": "{icon} {capacity}%",
-    "format-icons": ["\uf244", "\uf243", "\uf242", "\uf241", "\uf240"],
-    "states": { "warning": 25, "critical": 10 }
+    "format": "{icon}  {capacity}%",
+    "format-charging": "󰂄  {capacity}%",
+    "format-plugged": "󰚥  {capacity}%",
+    "format-icons": ["󰂎", "󰁺", "󰁻", "󰁼", "󰁽", "󰁾", "󰁿", "󰂀", "󰂁", "󰂂", "󰁹"],
+    "states": {
+      "warning": 25,
+      "critical": 10
+    }
+  },
+  "custom/performance": {
+    "format": "󱐋",
+    "tooltip": true,
+    "tooltip-format": "Профиль питания",
+    "on-click": "/usr/local/bin/performance-menu"
   }
 }
 EOF
 
 w "$H/.config/waybar/style.css" <<'EOF'
-* { font-family: "DejaVu Sans Mono", "FontAwesome"; font-size: 11px; border: none; border-radius: 0; min-height: 0; }
-window#waybar {
-  background: rgba(13,17,27,0.82);
-  color: #cdd6f4;
-  border: 1px solid rgba(137,180,250,0.35);
-  border-radius: 10px;
-}
-tooltip { background: rgba(13,17,27,0.95); border: 1px solid rgba(137,180,250,0.40); border-radius: 8px; }
-tooltip label { color: #cdd6f4; }
-#clock, #pulseaudio, #backlight, #battery, #language, #tray { padding: 0 7px; }
-#custom-launcher, #custom-files, #custom-term { color: #89b4fa; padding: 0 7px; }
-#custom-launcher { margin-left: 4px; }
-#custom-power { color: #f38ba8; padding: 0 10px 0 7px; }
-#clock { color: #b4d0ff; font-weight: bold; }
-#language { color: #74c7ec; }
-#pulseaudio.muted, #pulseaudio.source-muted { color: #5c6b8a; }
-#backlight { color: #a6c8ff; }
-#workspaces { margin-left: 6px; }
-#workspaces button {
-  color: #7f8fae; background: rgba(137,180,250,0.10);
-  padding: 0; margin: 4px 2px; min-width: 16px; border-radius: 9px;
-  box-shadow: none; text-shadow: none;
-}
-#workspaces button:hover { background: rgba(137,180,250,0.30); color: #e6ecf8; }
-#workspaces button.active { background: #89b4fa; color: #0d111b; min-width: 28px; }
-#battery.warning { color: #f9e2af; }
-#battery.critical { color: #f38ba8; }
+* { font-family: "JetBrainsMono Nerd Font", "Symbols Nerd Font", "DejaVu Sans", sans-serif; font-size: 11.5px; border: none; min-height: 0; }
+window#waybar { background: rgba(15, 20, 16, 0.92); color: #e4ebe2; border-bottom: 1px solid rgba(169, 204, 130, 0.30); }
+#custom-launcher { color: #a9cc82; background: transparent; padding: 0 10px 0 12px; margin: 4px 2px; border-radius: 6px; font-size: 13px; }
+#custom-launcher:hover { background: rgba(169, 204, 130, 0.18); color: #c4dfa0; }
+#workspaces button { color: #a8b8a0; background: transparent; padding: 0 9px; margin: 4px 2px; border-radius: 6px; transition: all 0.2s ease; }
+#workspaces button.active { background: #a9cc82; color: #0f1410; font-weight: 700; }
+#workspaces button:hover { background: rgba(169, 204, 130, 0.18); color: #e4ebe2; }
+#workspaces button.urgent { background: #d98b7d; color: #0f1410; font-weight: 700; }
+#clock { color: #e4ebe2; font-size: 13.5px; font-weight: 700; padding: 0 14px; letter-spacing: 0.2px; }
+#language, #pulseaudio, #backlight, #battery, #custom-performance { background: rgba(169, 204, 130, 0.06); color: #e4ebe2; border: 1px solid rgba(169, 204, 130, 0.25); border-radius: 6px; padding: 0 9px; margin: 4px 2px; }
+#language { color: #dfe8d8; }
+#pulseaudio.muted { color: #8a9a82; }
+#battery.warning { color: #d8b76c; border-color: rgba(216, 183, 108, 0.45); }
+#battery.critical { color: #d98b7d; border-color: rgba(217, 139, 125, 0.45); }
+#custom-performance { color: #c4dfa0; padding: 0 10px; margin-right: 8px; }
+#custom-performance:hover, #language:hover, #pulseaudio:hover, #backlight:hover, #battery:hover { background: rgba(169, 204, 130, 0.18); border-color: rgba(169, 204, 130, 0.55); }
+tooltip { background: rgb(20, 27, 22); border: 1px solid rgba(169, 204, 130, 0.45); border-radius: 8px; color: #e4ebe2; padding: 6px 10px; }
+tooltip label { color: #e4ebe2; }
 EOF
 
 # ---------- wofi ----------
@@ -1704,11 +2042,11 @@ insensitive=true
 hide_on_select=true
 EOF
 w "$H/.config/wofi/style.css" <<'EOF'
-window { background-color: rgba(13,17,27,0.88); border: 1px solid rgba(137,180,250,0.40); border-radius: 10px; font-family: "DejaVu Sans Mono"; font-size: 12px; }
-#input { background: rgba(137,180,250,0.08); color: #cdd6f4; border: 1px solid rgba(137,180,250,0.25); border-radius: 8px; margin: 6px; }
+window { background-color: rgba(15,20,16,0.88); border: 1px solid rgba(169,204,130,0.40); border-radius: 10px; font-family: "DejaVu Sans Mono"; font-size: 12px; }
+#input { background: rgba(169,204,130,0.08); color: #e4ebe2; border: 1px solid rgba(169,204,130,0.25); border-radius: 8px; margin: 6px; }
 #entry { padding: 4px 8px; border-radius: 6px; }
-#entry:selected { background-color: rgba(137,180,250,0.25); }
-#text { color: #cdd6f4; margin-left: 6px; }
+#entry:selected { background-color: rgba(169,204,130,0.25); }
+#text { color: #e4ebe2; margin-left: 6px; }
 EOF
 
 # ---------- GTK, fastfetch, обои ----------
@@ -1736,7 +2074,7 @@ w "$H/.config/hypr/wallpaper.sh" <<'EOF'
 D="$HOME/Pictures/wall"; C="$HOME/.cache/wallpaper"
 list="$(ls "$D"/*.png "$D"/*.jpg "$D"/*.jpeg "$D"/*.webp 2>/dev/null)"
 pkill swaybg 2>/dev/null
-[ -n "$list" ] || exec swaybg -c 0d111b
+[ -n "$list" ] || exec swaybg -c 0f1410
 cur="$(cat "$C" 2>/dev/null)"
 if [ "$1" = next ]; then
   f="$(printf '%s\n' "$list" | awk -v c="$cur" 'f{print;exit} $0==c{f=1}')"
@@ -1797,8 +2135,8 @@ text/html=firefox.desktop
 EOF
 
 # ---------- bash ----------
-grep -qF '38;5;111m' "$H/.bashrc" 2>/dev/null || cat >> "$H/.bashrc" <<'EOF'
-PS1='\[\e[38;5;111m\]\u \[\e[38;5;67m\]\w \[\e[0m\]\$ '
+grep -qF '38;5;150m' "$H/.bashrc" 2>/dev/null || cat >> "$H/.bashrc" <<'EOF'
+PS1='\[\e[38;5;150m\]\u \[\e[38;5;107m\]\w \[\e[0m\]\$ '
 EOF
 # автозапуск Hyprland на TTY1
 if ! grep -qsi 'hyprland' "$H/.bash_profile"; then
@@ -1814,7 +2152,7 @@ mkdir -p "$H/Pictures/wall"
 # реальное имя Font Awesome (иконки в waybar, меню питания)
 FA="$(fc-list : family 2>/dev/null | grep -o 'Font Awesome [0-9]* Free' | head -n1 || true)"
 FA="${FA:-Font Awesome 7 Free} Solid"
-sed -i "s/FontAwesome/$FA/g" /usr/local/bin/power-menu \
+sed -i "s/FontAwesome/$FA/g" /usr/local/bin/power-menu /usr/local/bin/performance-menu \
   "$H/.config/waybar/style.css"
 
 chown -R "$U:$G" "$H/.config" "$H/.local" "$H/Pictures" "$H/.bashrc" "$H/.bash_profile" 2>/dev/null || true
@@ -1945,7 +2283,8 @@ rm -rf "$H/.cache/thumbnails"
 
 echo
 echo "Готово. ПЕРЕЗАГРУЗИСЬ (reboot). После входа на TTY1 Hyprland запустится сам."
-echo "NVIDIA: драйверы удалены - система работает на встройке (Intel)."
+echo "NVIDIA: драйверы удалены, nouveau/nvidia заблокированы, карта отключена при загрузке - работает только Intel."
+echo "Профили питания: кнопка справа в waybar (энергосбережение / баланс / производительность)."
 echo "Обои: положи картинки в ~/Pictures/wall (светлые аниме-обои дадут вид как на фото)."
 echo "Визуализатор: открой терминал и набери  cava"
 echo
