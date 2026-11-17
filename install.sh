@@ -27,10 +27,10 @@ pacman -S --noconfirm --needed \
   pipewire pipewire-pulse wireplumber \
   brightnessctl grim slurp wl-clipboard \
   ttf-dejavu ttf-font-awesome noto-fonts-emoji papirus-icon-theme adwaita-icon-theme lxqt-policykit ttf-jetbrains-mono-nerd ttf-nerd-fonts-symbols \
-  python-gobject gtk3 mesa vulkan-intel power-profiles-daemon udisks2 xdg-utils xdg-user-dirs \
+  python-gobject gtk3 mesa vulkan-intel power-profiles-daemon libpulse networkmanager udisks2 xdg-utils xdg-user-dirs \
   fastfetch chafa cava nano curl \
   firefox firefox-i18n-ru telegram-desktop \
-  jre21-openjdk prismlauncher
+  jre21-openjdk
 echo "=== Steam ==="
 pacman -S --noconfirm --needed steam lib32-mesa lib32-vulkan-intel \
   || echo "!! Steam не установился (скрипт продолжает работу)"
@@ -69,6 +69,24 @@ if command -v mkinitcpio >/dev/null 2>&1; then mkinitcpio -P || echo "!! mkinitc
 # профили питания (меню производительности)
 systemctl enable power-profiles-daemon.service >/dev/null 2>&1 || echo "!! не удалось включить power-profiles-daemon"
 systemctl start power-profiles-daemon.service >/dev/null 2>&1 || true
+
+# Prism Launcher больше не нужен: убрать, если уже установлен
+if pacman -Q prismlauncher >/dev/null 2>&1; then pacman -Rns --noconfirm prismlauncher || echo "!! не удалось удалить prismlauncher"; fi
+
+# сеть: меню Wi-Fi работает через NetworkManager (включаем, только если нет другого сетевого сервиса)
+if ! systemctl is-active --quiet NetworkManager.service; then
+  other=""
+  for s in iwd systemd-networkd dhcpcd wpa_supplicant connman netctl; do
+    if systemctl is-enabled --quiet "$s.service" 2>/dev/null || systemctl is-active --quiet "$s.service" 2>/dev/null; then
+      other="$other $s"
+    fi
+  done
+  if [ -z "$other" ]; then
+    systemctl enable --now NetworkManager.service >/dev/null 2>&1 || echo "!! не удалось включить NetworkManager"
+  else
+    echo "!! сеть сейчас управляется:$other - меню сети в waybar заработает только с NetworkManager"
+  fi
+fi
 
 # ================= системные утилиты =================
 cat > /usr/local/bin/pkg-install <<'EOF2'
@@ -175,6 +193,7 @@ PLACES = [
     ("folder-videos-symbolic", "Видео", os.path.join(HOME, "Videos")),
 ]
 SKIP_FS = ("swap", "crypto_LUKS", "LVM2_member", "linux_raid_member")
+ARCHIVE_EXT = (".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")
 
 
 def human(n):
@@ -279,6 +298,50 @@ def restore(path):
     except OSError:
         pass
     return dst
+
+
+def make_zip(paths, dest):
+    """Пакует paths в zip. Возвращает список ошибок (пустой - всё хорошо)."""
+    import zipfile
+    errs = []
+    try:
+        with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as z:
+            for src in paths:
+                base = os.path.dirname(src)
+                todo = [src]
+                if is_real_dir(src):
+                    for r, ds, fs in os.walk(src):
+                        todo.extend(os.path.join(r, n) for n in ds + fs)
+                for p in todo:
+                    try:
+                        z.write(p, os.path.relpath(p, base))
+                    except Exception as e:
+                        errs.append(err_text(e))
+    except Exception as e:
+        errs.append(err_text(e))
+    return errs
+
+
+def extract_archive(src, dest):
+    """Распаковывает zip/tar в новую папку dest. Возвращает список ошибок."""
+    import tarfile
+    import zipfile
+    try:
+        os.makedirs(dest)
+        if zipfile.is_zipfile(src):
+            with zipfile.ZipFile(src) as z:
+                z.extractall(dest)
+        elif tarfile.is_tarfile(src):
+            if not hasattr(tarfile, "data_filter"):
+                raise OSError("в этом Python нет безопасной распаковки tar")
+            with tarfile.open(src) as t:
+                t.extractall(dest, filter="data")
+        else:
+            raise OSError("это не zip/tar-архив")
+    except Exception as e:
+        shutil.rmtree(dest, ignore_errors=True)
+        return [err_text(e)]
+    return []
 
 
 def empty_trash():
@@ -393,6 +456,8 @@ class FilesWindow(Gtk.Window):
         self.devs = []
         self.marks = load_marks()
         self.sizes = {}
+        self.items = []
+        self.ftext = ""
         self.drag_paths = []
         self.drag_xy = (0, 0)
         self.scroll_id = 0
@@ -411,6 +476,11 @@ class FilesWindow(Gtk.Window):
         self.entry = Gtk.Entry()
         self.entry.set_hexpand(True)
         self.entry.connect("activate", self.on_entry)
+        self.filter = Gtk.Entry()
+        self.filter.set_placeholder_text("Фильтр (Ctrl+F)")
+        self.filter.set_width_chars(16)
+        self.filter_id = self.filter.connect("changed", self.on_filter)
+        self.filter.connect("activate", lambda *_: self.view.grab_focus())
         self.b_new = self.icon_button("folder-new-symbolic", lambda *_: self.new_folder())
         self.b_new.set_tooltip_text("Новая папка (Ctrl+Shift+N)")
         self.b_newf = self.icon_button("document-new-symbolic", lambda *_: self.new_file())
@@ -422,6 +492,7 @@ class FilesWindow(Gtk.Window):
         for w in (self.b_back, self.b_fwd, self.b_up):
             bar.pack_start(w, False, False, 0)
         bar.pack_start(self.entry, True, True, 0)
+        bar.pack_start(self.filter, False, False, 0)
         bar.pack_start(self.b_new, False, False, 0)
         bar.pack_start(self.b_newf, False, False, 0)
         bar.pack_start(self.b_hidden, False, False, 0)
@@ -838,6 +909,20 @@ class FilesWindow(Gtk.Window):
         files = sorted([i for i in items if not i.isdir], key=kf, reverse=rev)
         return dirs + files
 
+    def fill(self):
+        q = self.ftext.lower()
+        items = [i for i in self.items if q in i.name.lower()] if q else self.items
+        self.sizes = {i.path: i.size for i in items if not i.isdir}
+        self.store.clear()
+        for it in self.sort_items(items):
+            self.store.append([it.icon, it.name, "" if it.isdir else human(it.size),
+                               time.strftime("%d.%m.%Y %H:%M", time.localtime(it.mtime)), it.isdir, it.path])
+
+    def on_filter(self, entry):
+        self.ftext = entry.get_text().strip()
+        self.fill()
+        self.update_status()
+
     def load(self, path, push=True, select=None):
         path = os.path.realpath(os.path.expanduser(path))
         try:
@@ -848,12 +933,14 @@ class FilesWindow(Gtk.Window):
         if push and self.cwd and self.cwd != path:
             self.hist.append(self.cwd)
             self.fwd = []
+        if self.ftext and path != self.cwd:
+            self.ftext = ""
+            self.filter.handler_block(self.filter_id)
+            self.filter.set_text("")
+            self.filter.handler_unblock(self.filter_id)
         self.cwd = path
-        self.sizes = {i.path: i.size for i in items if not i.isdir}
-        self.store.clear()
-        for it in self.sort_items(items):
-            self.store.append([it.icon, it.name, "" if it.isdir else human(it.size),
-                               time.strftime("%d.%m.%Y %H:%M", time.localtime(it.mtime)), it.isdir, it.path])
+        self.items = items
+        self.fill()
         shown = path.replace(HOME, "~", 1) if path.startswith(HOME) else path
         self.entry.set_text(shown)
         self.set_title(os.path.basename(path) or "/")
@@ -883,14 +970,20 @@ class FilesWindow(Gtk.Window):
     def update_status(self, *_):
         rows = self.selected_rows()
         total = len(self.store)
+        try:
+            free = "  ·  свободно " + human(shutil.disk_usage(self.cwd).free)
+        except (OSError, TypeError):
+            free = ""
         if rows:
             total_size = sum(int(self.sizes.get(self.store[r][5], 0)) for r in rows)
             text = f"Выбрано: {len(rows)} из {total}"
             if total_size:
                 text += f"  ·  {human(total_size)}"
-            self.say(text)
+        elif self.ftext:
+            text = f"Найдено: {total} из {len(self.items)}"
         else:
-            self.say(f"{total} элементов" if total else "Папка пуста")
+            text = f"{total} элементов" if total else "Папка пуста"
+        self.say(text + free)
 
     def go_back(self, *_):
         if self.hist:
@@ -1195,6 +1288,80 @@ class FilesWindow(Gtk.Window):
         dlg.destroy()
 
     # ---------- мышь и клавиши ----------
+    def open_with_menu(self, path):
+        ctype, _ = Gio.content_type_guess(path, None)
+        apps = [a for a in Gio.AppInfo.get_all_for_type(ctype) if a.should_show()]
+        if not apps:
+            apps = [a for a in Gio.AppInfo.get_all() if a.should_show()]
+        if not apps:
+            return None
+        sub = Gtk.Menu()
+        for a in apps[:14]:
+            it = Gtk.MenuItem(label=a.get_display_name())
+            it.connect("activate", lambda w, a=a: self.launch_with(a, path))
+            sub.append(it)
+        return sub
+
+    def launch_with(self, app, path):
+        try:
+            app.launch([Gio.File.new_for_path(path)], None)
+        except GLib.Error as e:
+            self.say("Не удалось открыть: " + e.message, True)
+
+    def duplicate(self):
+        paths = self.selected_paths()
+        if paths:
+            self.run_transfer(paths, self.cwd, False)
+
+    def compress(self):
+        paths = self.selected_paths()
+        if not paths:
+            return
+        name = (os.path.basename(paths[0]) if len(paths) == 1 else "archive") + ".zip"
+        dest = unique(self.cwd, name)
+        self.say("Сжимаю…")
+
+        def work():
+            errs = make_zip(paths, dest)
+            GLib.idle_add(self.after_pack, dest, errs, "Создан архив: ")
+        threading.Thread(target=work, daemon=True).start()
+
+    def extract(self):
+        paths = self.selected_paths()
+        if len(paths) != 1:
+            return
+        src = paths[0]
+        stem = re.sub(r"(\.tar\.(gz|bz2|xz)|\.tgz|\.tbz2|\.txz|\.tar|\.zip)$", "", os.path.basename(src), flags=re.I)
+        dest = unique(self.cwd, stem or "archive")
+        self.say("Распаковываю…")
+
+        def work():
+            errs = extract_archive(src, dest)
+            GLib.idle_add(self.after_pack, dest, errs, "Распаковано в: ")
+        threading.Thread(target=work, daemon=True).start()
+
+    def after_pack(self, dest, errs, prefix):
+        self.reload(select=os.path.basename(dest))
+        if errs:
+            self.say("Ошибка: " + errs[0] + (f"  (и ещё {len(errs) - 1})" if len(errs) > 1 else ""), True)
+        else:
+            self.say(prefix + os.path.basename(dest))
+        return False
+
+    def invert_selection(self):
+        sel = self.view.get_selection()
+        for row in self.store:
+            if sel.path_is_selected(row.path):
+                sel.unselect_path(row.path)
+            else:
+                sel.select_path(row.path)
+
+    def new_window(self):
+        try:
+            subprocess.Popen([sys.executable, os.path.abspath(sys.argv[0]), self.cwd], start_new_session=True)
+        except OSError as e:
+            self.say("Не удалось открыть окно: " + err_text(e), True)
+
     def on_view_click(self, view, ev):
         if ev.button == 1 and ev.type == Gdk.EventType.BUTTON_PRESS:
             # рамка выделения - только с пустого места, иначе строку можно тащить
@@ -1227,6 +1394,12 @@ class FilesWindow(Gtk.Window):
         in_tr = in_trash(self.cwd)
         if one:
             add("Открыть", lambda: self.on_row_activated(view, self.selected_rows()[0], None))
+        if one and not one_dir:
+            sub = self.open_with_menu(one_path)
+            if sub is not None:
+                mi = Gtk.MenuItem(label="Открыть с помощью")
+                mi.set_submenu(sub)
+                menu.append(mi)
         if one_dir:
             add("Открыть в терминале", lambda: self.open_terminal(one_path))
             marked = os.path.realpath(one_path) in self.marks
@@ -1248,10 +1421,16 @@ class FilesWindow(Gtk.Window):
         sep()
         add("Копировать путь", self.copy_path)
         if not in_tr:
+            add("Создать копию", self.duplicate, has)
+            add("Сжать в zip", self.compress, has)
+            if one and not one_dir and one_path.lower().endswith(ARCHIVE_EXT):
+                add("Распаковать сюда", self.extract)
             add("Новая папка", self.new_folder)
             add("Новый файл", self.new_file)
         sep()
         add("Выделить всё", self.select_all)
+        add("Инвертировать выделение", self.invert_selection)
+        add("Новое окно", self.new_window)
         add("Терминал здесь", self.open_terminal)
         add("Свойства", self.properties)
         menu.show_all()
@@ -1270,7 +1449,12 @@ class FilesWindow(Gtk.Window):
         if ctrl and key in ("l", "L"):
             self.entry.grab_focus()
             return True
+        if ctrl and key in ("f", "F"):
+            self.filter.grab_focus()
+            return True
         if key == "Escape" and typing:
+            if self.get_focus() is self.filter:
+                self.filter.set_text("")
             self.view.grab_focus()
             return True
         if typing:
@@ -1295,6 +1479,10 @@ class FilesWindow(Gtk.Window):
             self.new_folder()
         elif ctrl and key in ("a", "A"):
             self.select_all()
+        elif ctrl and key in ("i", "I"):
+            self.invert_selection()
+        elif ctrl and key in ("n", "N"):
+            self.new_window()
         elif ctrl and key in ("d", "D"):
             self.toggle_mark(self.cwd)
         elif ctrl and key in ("c", "C"):
@@ -1340,7 +1528,7 @@ import subprocess
 import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
-from gi.repository import Gdk, GLib, Gtk
+from gi.repository import Gdk, GLib, Gtk, Pango
 
 LOCK = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "power-menu.pid")
 CSS = b"""
@@ -1403,6 +1591,34 @@ def logout():
         pass
 
 
+FA_FONT = "FontAwesome"
+
+
+class Glyph(Gtk.DrawingArea):
+    # иконка рисуется по центру реального контура глифа, а не по рамке строки,
+    # поэтому боковые отступы шрифта не сдвигают её вправо
+    def __init__(self, text, size, w=56, h=44):
+        super().__init__()
+        self.text, self.size = text, size
+        self.set_size_request(w, h)
+        self.set_halign(Gtk.Align.CENTER)
+        self.get_style_context().add_class("icon")
+        self.connect("draw", self.on_draw)
+
+    def on_draw(self, widget, cr):
+        alloc = widget.get_allocation()
+        layout = widget.create_pango_layout(self.text)
+        fd = Pango.FontDescription()
+        fd.set_family(FA_FONT + ",Symbols Nerd Font Mono,Symbols Nerd Font")
+        fd.set_absolute_size(self.size * Pango.SCALE)
+        layout.set_font_description(fd)
+        ink, _logical = layout.get_pixel_extents()
+        x = round((alloc.width - ink.width) / 2 - ink.x)
+        y = round((alloc.height - ink.height) / 2 - ink.y)
+        Gtk.render_layout(widget.get_style_context(), cr, x, y, layout)
+        return False
+
+
 class PowerMenu(Gtk.Window):
     def __init__(self):
         super().__init__(title="power-menu")
@@ -1438,8 +1654,10 @@ class PowerMenu(Gtk.Window):
                 b.get_style_context().add_class("danger")
             col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
             col.set_valign(Gtk.Align.CENTER)
-            for text, cls in ((icon, "icon"), (name, "name"), (key, "key")):
+            col.pack_start(Glyph(icon, 30), False, False, 0)
+            for text, cls in ((name, "name"), (key, "key")):
                 lab = Gtk.Label(label=text)
+                lab.set_halign(Gtk.Align.CENTER)
                 lab.get_style_context().add_class(cls)
                 col.pack_start(lab, False, False, 0)
             b.add(col)
@@ -1530,7 +1748,7 @@ import subprocess
 import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
-from gi.repository import Gdk, GLib, Gtk
+from gi.repository import Gdk, GLib, Gtk, Pango
 
 LOCK = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "performance-menu.pid")
 CSS = b"""
@@ -1595,6 +1813,34 @@ def drop_lock():
         pass
 
 
+FA_FONT = "FontAwesome"
+
+
+class Glyph(Gtk.DrawingArea):
+    # иконка рисуется по центру реального контура глифа, а не по рамке строки,
+    # поэтому боковые отступы шрифта не сдвигают её вправо
+    def __init__(self, text, size, w=56, h=44):
+        super().__init__()
+        self.text, self.size = text, size
+        self.set_size_request(w, h)
+        self.set_halign(Gtk.Align.CENTER)
+        self.get_style_context().add_class("icon")
+        self.connect("draw", self.on_draw)
+
+    def on_draw(self, widget, cr):
+        alloc = widget.get_allocation()
+        layout = widget.create_pango_layout(self.text)
+        fd = Pango.FontDescription()
+        fd.set_family(FA_FONT + ",Symbols Nerd Font Mono,Symbols Nerd Font")
+        fd.set_absolute_size(self.size * Pango.SCALE)
+        layout.set_font_description(fd)
+        ink, _logical = layout.get_pixel_extents()
+        x = round((alloc.width - ink.width) / 2 - ink.x)
+        y = round((alloc.height - ink.height) / 2 - ink.y)
+        Gtk.render_layout(widget.get_style_context(), cr, x, y, layout)
+        return False
+
+
 class PerfMenu(Gtk.Window):
     def __init__(self):
         super().__init__(title="performance-menu")
@@ -1640,8 +1886,10 @@ class PerfMenu(Gtk.Window):
             col.set_valign(Gtk.Align.CENTER)
             is_cur = prof == cur
             key_text = key + ("  \u00b7  сейчас" if is_cur else "")
-            for text, cls in ((icon, "icon"), (name, "name"), (desc, "desc"), (key_text, "key")):
+            col.pack_start(Glyph(icon, 30), False, False, 0)
+            for text, cls in ((name, "name"), (desc, "desc"), (key_text, "key")):
                 lab = Gtk.Label(label=text)
+                lab.set_halign(Gtk.Align.CENTER)
                 lab.get_style_context().add_class(cls)
                 col.pack_start(lab, False, False, 0)
             b.add(col)
@@ -1755,6 +2003,1325 @@ if __name__ == "__main__":
     main()
 EOF
 chmod 755 /usr/local/bin/performance-menu
+
+# ---------- меню звука, сети, календарь на год ----------
+cat > /usr/local/bin/audio-menu <<'EOF'
+#!/usr/bin/python3
+import json
+import os
+import re
+import subprocess
+import threading
+import time
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, GLib, Gtk, Pango
+
+NAME = "audio-menu"
+LOCK = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), NAME + ".pid")
+FA_FONT = "FontAwesome"
+BASE_CSS = b"""
+* { font-family: "DejaVu Sans Mono", "FontAwesome", monospace; }
+window { background-color: rgba(4,7,5,0.60); }
+.card { background-color: rgba(15,20,16,0.90); border: 1px solid rgba(169,204,130,0.45);
+border-radius: 20px; padding: 20px 24px 14px 24px; }
+.title { color: #e4ebe2; font-size: 14px; }
+.sub { color: #8a9a82; font-size: 10px; }
+.sect { color: #8a9a82; font-size: 9px; }
+.name { color: #e4ebe2; font-size: 11px; }
+.pct { color: #a8b8a0; font-size: 10px; }
+.err { color: #d98b7d; font-size: 10px; }
+.ok { color: #a9cc82; font-size: 10px; }
+.hint { color: #75846d; font-size: 9px; }
+button { background-image: none; background-color: rgba(169,204,130,0.06); color: #e4ebe2;
+border: 1px solid rgba(169,204,130,0.25); border-radius: 12px; box-shadow: none;
+padding: 2px 10px; min-height: 0; min-width: 0; }
+button:hover, button:focus { background-color: rgba(169,204,130,0.18); border-color: #a9cc82; }
+button.off { color: #d98b7d; border-color: rgba(217,139,125,0.45); }
+entry { background-image: none; background-color: rgba(169,204,130,0.06); color: #e4ebe2;
+border: 1px solid rgba(169,204,130,0.25); border-radius: 12px; box-shadow: none; padding: 3px 10px; min-height: 0; }
+entry:focus { border-color: #a9cc82; }
+scale trough { background-color: rgba(169,204,130,0.18); background-image: none; border: none;
+border-radius: 4px; min-height: 6px; }
+scale highlight { background-color: #a9cc82; background-image: none; border: none; border-radius: 4px; }
+scale slider { background-color: #e4ebe2; background-image: none; border: none; box-shadow: none;
+border-radius: 50%; min-width: 16px; min-height: 16px; margin: -5px; }
+scale.muted highlight { background-color: #75846d; }
+scale.muted slider { background-color: #a8b8a0; }
+scrolledwindow, viewport { background-color: transparent; }
+scrollbar slider { background-color: rgba(169,204,130,0.35); border-radius: 4px; min-width: 6px; min-height: 6px; margin: 0; }
+scrollbar { background: transparent; border: none; }
+"""
+
+
+def running():
+    try:
+        with open(LOCK) as f:
+            pid = int(f.read().strip())
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return pid if NAME.encode() in f.read() else 0
+    except Exception:
+        return 0
+
+
+def drop_lock():
+    try:
+        os.remove(LOCK)
+    except OSError:
+        pass
+
+
+def apply_css(screen, css):
+    for rule in re.findall(rb"[^{}]+\{[^{}]*\}", css):
+        prov = Gtk.CssProvider()
+        try:
+            prov.load_from_data(rule)
+        except GLib.Error:
+            continue
+        Gtk.StyleContext.add_provider_for_screen(screen, prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+
+def label(text, cls=None, xalign=0.5, chars=None):
+    lab = Gtk.Label(label=text, xalign=xalign)
+    if cls:
+        lab.get_style_context().add_class(cls)
+    if chars:
+        lab.set_width_chars(chars)
+    return lab
+
+
+class Glyph(Gtk.DrawingArea):
+    # иконка рисуется по центру реального контура глифа, а не по рамке строки,
+    # поэтому боковые отступы шрифта не сдвигают её вправо
+    def __init__(self, text, size, w=40, h=30, cls=None):
+        super().__init__()
+        self.text, self.size = text, size
+        self.set_size_request(w, h)
+        self.set_halign(Gtk.Align.CENTER)
+        self.set_valign(Gtk.Align.CENTER)
+        ctx = self.get_style_context()
+        ctx.add_class("icon")
+        if cls:
+            ctx.add_class(cls)
+        self.connect("draw", self.on_draw)
+
+    def set_text(self, text):
+        self.text = text
+        self.queue_draw()
+
+    def on_draw(self, widget, cr):
+        alloc = widget.get_allocation()
+        layout = widget.create_pango_layout(self.text)
+        fd = Pango.FontDescription()
+        fd.set_family(FA_FONT + ",Symbols Nerd Font Mono,Symbols Nerd Font")
+        fd.set_absolute_size(self.size * Pango.SCALE)
+        layout.set_font_description(fd)
+        ink, _logical = layout.get_pixel_extents()
+        x = round((alloc.width - ink.width) / 2 - ink.x)
+        y = round((alloc.height - ink.height) / 2 - ink.y)
+        Gtk.render_layout(widget.get_style_context(), cr, x, y, layout)
+        return False
+
+
+def sh(args, timeout=3, env=None):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=env)
+    except Exception:
+        return None
+
+
+def fire(args):
+    threading.Thread(target=sh, args=(args,), daemon=True).start()
+
+
+class Overlay(Gtk.Window):
+    def __init__(self, extra_css=b""):
+        super().__init__(title=NAME)
+        self.set_decorated(False)
+        screen = self.get_screen()
+        visual = screen.get_rgba_visual()
+        if visual:
+            self.set_visual(visual)
+        apply_css(screen, BASE_CSS + extra_css)
+        bg = Gtk.EventBox()
+        bg.set_visible_window(False)
+        bg.connect("button-press-event", lambda w, e: self.quit())
+        hold = Gtk.EventBox()
+        hold.set_visible_window(False)
+        hold.set_halign(Gtk.Align.CENTER)
+        hold.set_valign(Gtk.Align.CENTER)
+        hold.connect("button-press-event", lambda w, e: True)
+        self.card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self.card.get_style_context().add_class("card")
+        hold.add(self.card)
+        bg.add(hold)
+        self.add(bg)
+        self.connect("key-press-event", self.on_key)
+        self.fullscreen()
+
+    def on_key(self, w, ev):
+        k = Gdk.keyval_name(ev.keyval) or ""
+        if k == "Escape":
+            self.quit()
+            return True
+        return self.key(k, ev)
+
+    def key(self, name, ev):
+        return False
+
+    def quit(self):
+        self.destroy()
+
+
+def on_destroy(*_):
+    drop_lock()
+    Gtk.main_quit()
+
+
+def run(cls):
+    GLib.set_prgname(NAME)
+    GLib.set_application_name(NAME)
+    pid = running()
+    if pid:
+        try:
+            os.kill(pid, 15)
+        except OSError:
+            pass
+        drop_lock()
+        return
+    w = cls()
+    w.connect("destroy", on_destroy)
+    w.show_all()
+    try:
+        with open(LOCK, "w") as f:
+            f.write(str(os.getpid()))
+    except OSError:
+        pass
+    first = getattr(w, "first", None)
+    if first is not None:
+        first.grab_focus()
+    Gtk.main()
+
+
+EXTRA_CSS = b"""
+.row-name { color: #e4ebe2; font-size: 11px; }
+"""
+SINK = "@DEFAULT_AUDIO_SINK@"
+SOURCE = "@DEFAULT_AUDIO_SOURCE@"
+ICON_SPK = ("\uf028", "\uf026")
+ICON_MIC = ("\uf130", "\uf131")
+
+
+def wp_state(target):
+    r = sh(["wpctl", "get-volume", target])
+    if not r or r.returncode != 0:
+        return None
+    m = re.search(r"Volume:\s*([0-9.]+)", r.stdout)
+    if not m:
+        return None
+    return min(100, round(float(m.group(1)) * 100)), "[MUTED]" in r.stdout
+
+
+def app_streams():
+    r = sh(["pactl", "--format=json", "list", "sink-inputs"])
+    if not r or r.returncode != 0:
+        return []
+    try:
+        data = json.loads(r.stdout)
+    except ValueError:
+        return []
+    out = []
+    for s in data:
+        props = s.get("properties") or {}
+        name = (props.get("application.name") or props.get("application.process.binary")
+                or props.get("media.name") or "Приложение")
+        vols = []
+        for v in (s.get("volume") or {}).values():
+            try:
+                vols.append(int(str(v.get("value_percent", "0")).rstrip("%")))
+            except ValueError:
+                pass
+        out.append({"id": s.get("index"), "name": str(name), "vol": max(vols) if vols else 0,
+                    "mute": bool(s.get("mute"))})
+    return out
+
+
+class VolRow(Gtk.Box):
+    def __init__(self, title, vol, muted, icons, on_vol, on_mute):
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self.icons, self.muted, self.on_vol, self.on_mute = icons, muted, on_vol, on_mute
+        self.pending = 0
+        self.btn = Gtk.Button()
+        self.glyph = Glyph(icons[1] if muted else icons[0], 15, 24, 22)
+        self.btn.add(self.glyph)
+        self.btn.set_size_request(42, 32)
+        self.btn.set_valign(Gtk.Align.CENTER)
+        self.btn.connect("clicked", self.on_click)
+        name = label(title, "row-name", xalign=0, chars=16)
+        name.set_max_width_chars(16)
+        name.set_ellipsize(Pango.EllipsizeMode.END)
+        self.scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
+        self.scale.set_draw_value(False)
+        self.scale.set_hexpand(True)
+        self.scale.set_size_request(240, -1)
+        self.scale.set_value(min(vol, 100))
+        self.pct = label(f"{vol}%", "pct", xalign=1, chars=4)
+        self.scale.connect("value-changed", self.changed)
+        self.pack_start(self.btn, False, False, 0)
+        self.pack_start(name, False, False, 0)
+        self.pack_start(self.scale, True, True, 0)
+        self.pack_start(self.pct, False, False, 0)
+        self.paint()
+
+    def paint(self):
+        self.glyph.set_text(self.icons[1] if self.muted else self.icons[0])
+        for w, cls in ((self.btn, "off"), (self.scale, "muted")):
+            ctx = w.get_style_context()
+            if self.muted:
+                ctx.add_class(cls)
+            else:
+                ctx.remove_class(cls)
+
+    def changed(self, scale):
+        v = int(scale.get_value())
+        self.pct.set_text(f"{v}%")
+        if self.pending:
+            GLib.source_remove(self.pending)
+        self.pending = GLib.timeout_add(70, self.push, v)
+
+    def push(self, v):
+        self.pending = 0
+        self.on_vol(v)
+        return False
+
+    def on_click(self, *_):
+        self.on_mute()
+        self.muted = not self.muted
+        self.paint()
+
+
+class AudioMenu(Overlay):
+    def __init__(self):
+        super().__init__(EXTRA_CSS)
+        self.first = None
+        card = self.card
+        card.set_spacing(10)
+        card.pack_start(label("Звук", "title"), False, False, 0)
+
+        card.pack_start(label("ВЫВОД", "sect", xalign=0), False, False, 0)
+        st = wp_state(SINK)
+        if st:
+            row = VolRow("Динамики", st[0], st[1], ICON_SPK,
+                         lambda v: fire(["wpctl", "set-volume", SINK, f"{v / 100:.2f}"]),
+                         lambda: fire(["wpctl", "set-mute", SINK, "toggle"]))
+            self.first = row.scale
+            card.pack_start(row, False, False, 0)
+        else:
+            card.pack_start(label("устройство вывода не найдено", "err", xalign=0), False, False, 0)
+
+        card.pack_start(label("МИКРОФОН", "sect", xalign=0), False, False, 6)
+        st = wp_state(SOURCE)
+        if st:
+            row = VolRow("Микрофон", st[0], st[1], ICON_MIC,
+                         lambda v: fire(["wpctl", "set-volume", SOURCE, f"{v / 100:.2f}"]),
+                         lambda: fire(["wpctl", "set-mute", SOURCE, "toggle"]))
+            if self.first is None:
+                self.first = row.scale
+            card.pack_start(row, False, False, 0)
+        else:
+            card.pack_start(label("микрофон не найден", "sub", xalign=0), False, False, 0)
+
+        card.pack_start(label("ПРИЛОЖЕНИЯ", "sect", xalign=0), False, False, 6)
+        apps = app_streams()
+        if apps:
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            for a in apps:
+                sid = str(a["id"])
+                box.pack_start(VolRow(a["name"], a["vol"], a["mute"], ICON_SPK,
+                                      lambda v, sid=sid: fire(["pactl", "set-sink-input-volume", sid, f"{v}%"]),
+                                      lambda sid=sid: fire(["pactl", "set-sink-input-mute", sid, "toggle"])),
+                               False, False, 0)
+            sc = Gtk.ScrolledWindow()
+            sc.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            sc.set_propagate_natural_height(True)
+            sc.set_max_content_height(240)
+            sc.add(box)
+            card.pack_start(sc, False, False, 0)
+        else:
+            card.pack_start(label("сейчас ни одно приложение не играет", "sub", xalign=0), False, False, 0)
+
+        card.pack_start(label("колесо мыши или ← → на ползунке    Esc  закрыть", "hint"), False, False, 6)
+
+
+if __name__ == "__main__":
+    run(AudioMenu)
+EOF
+chmod 755 /usr/local/bin/audio-menu
+
+cat > /usr/local/bin/network-menu <<'EOF'
+#!/usr/bin/python3
+import json
+import os
+import re
+import subprocess
+import threading
+import time
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, GLib, Gtk, Pango
+
+NAME = "network-menu"
+LOCK = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), NAME + ".pid")
+FA_FONT = "FontAwesome"
+BASE_CSS = b"""
+* { font-family: "DejaVu Sans Mono", "FontAwesome", monospace; }
+window { background-color: rgba(4,7,5,0.60); }
+.card { background-color: rgba(15,20,16,0.90); border: 1px solid rgba(169,204,130,0.45);
+border-radius: 20px; padding: 20px 24px 14px 24px; }
+.title { color: #e4ebe2; font-size: 14px; }
+.sub { color: #8a9a82; font-size: 10px; }
+.sect { color: #8a9a82; font-size: 9px; }
+.name { color: #e4ebe2; font-size: 11px; }
+.pct { color: #a8b8a0; font-size: 10px; }
+.err { color: #d98b7d; font-size: 10px; }
+.ok { color: #a9cc82; font-size: 10px; }
+.hint { color: #75846d; font-size: 9px; }
+button { background-image: none; background-color: rgba(169,204,130,0.06); color: #e4ebe2;
+border: 1px solid rgba(169,204,130,0.25); border-radius: 12px; box-shadow: none;
+padding: 2px 10px; min-height: 0; min-width: 0; }
+button:hover, button:focus { background-color: rgba(169,204,130,0.18); border-color: #a9cc82; }
+button.off { color: #d98b7d; border-color: rgba(217,139,125,0.45); }
+entry { background-image: none; background-color: rgba(169,204,130,0.06); color: #e4ebe2;
+border: 1px solid rgba(169,204,130,0.25); border-radius: 12px; box-shadow: none; padding: 3px 10px; min-height: 0; }
+entry:focus { border-color: #a9cc82; }
+scale trough { background-color: rgba(169,204,130,0.18); background-image: none; border: none;
+border-radius: 4px; min-height: 6px; }
+scale highlight { background-color: #a9cc82; background-image: none; border: none; border-radius: 4px; }
+scale slider { background-color: #e4ebe2; background-image: none; border: none; box-shadow: none;
+border-radius: 50%; min-width: 16px; min-height: 16px; margin: -5px; }
+scale.muted highlight { background-color: #75846d; }
+scale.muted slider { background-color: #a8b8a0; }
+scrolledwindow, viewport { background-color: transparent; }
+scrollbar slider { background-color: rgba(169,204,130,0.35); border-radius: 4px; min-width: 6px; min-height: 6px; margin: 0; }
+scrollbar { background: transparent; border: none; }
+"""
+
+
+def running():
+    try:
+        with open(LOCK) as f:
+            pid = int(f.read().strip())
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return pid if NAME.encode() in f.read() else 0
+    except Exception:
+        return 0
+
+
+def drop_lock():
+    try:
+        os.remove(LOCK)
+    except OSError:
+        pass
+
+
+def apply_css(screen, css):
+    for rule in re.findall(rb"[^{}]+\{[^{}]*\}", css):
+        prov = Gtk.CssProvider()
+        try:
+            prov.load_from_data(rule)
+        except GLib.Error:
+            continue
+        Gtk.StyleContext.add_provider_for_screen(screen, prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+
+def label(text, cls=None, xalign=0.5, chars=None):
+    lab = Gtk.Label(label=text, xalign=xalign)
+    if cls:
+        lab.get_style_context().add_class(cls)
+    if chars:
+        lab.set_width_chars(chars)
+    return lab
+
+
+class Glyph(Gtk.DrawingArea):
+    # иконка рисуется по центру реального контура глифа, а не по рамке строки,
+    # поэтому боковые отступы шрифта не сдвигают её вправо
+    def __init__(self, text, size, w=40, h=30, cls=None):
+        super().__init__()
+        self.text, self.size = text, size
+        self.set_size_request(w, h)
+        self.set_halign(Gtk.Align.CENTER)
+        self.set_valign(Gtk.Align.CENTER)
+        ctx = self.get_style_context()
+        ctx.add_class("icon")
+        if cls:
+            ctx.add_class(cls)
+        self.connect("draw", self.on_draw)
+
+    def set_text(self, text):
+        self.text = text
+        self.queue_draw()
+
+    def on_draw(self, widget, cr):
+        alloc = widget.get_allocation()
+        layout = widget.create_pango_layout(self.text)
+        fd = Pango.FontDescription()
+        fd.set_family(FA_FONT + ",Symbols Nerd Font Mono,Symbols Nerd Font")
+        fd.set_absolute_size(self.size * Pango.SCALE)
+        layout.set_font_description(fd)
+        ink, _logical = layout.get_pixel_extents()
+        x = round((alloc.width - ink.width) / 2 - ink.x)
+        y = round((alloc.height - ink.height) / 2 - ink.y)
+        Gtk.render_layout(widget.get_style_context(), cr, x, y, layout)
+        return False
+
+
+def sh(args, timeout=3, env=None):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=env)
+    except Exception:
+        return None
+
+
+def fire(args):
+    threading.Thread(target=sh, args=(args,), daemon=True).start()
+
+
+class Overlay(Gtk.Window):
+    def __init__(self, extra_css=b""):
+        super().__init__(title=NAME)
+        self.set_decorated(False)
+        screen = self.get_screen()
+        visual = screen.get_rgba_visual()
+        if visual:
+            self.set_visual(visual)
+        apply_css(screen, BASE_CSS + extra_css)
+        bg = Gtk.EventBox()
+        bg.set_visible_window(False)
+        bg.connect("button-press-event", lambda w, e: self.quit())
+        hold = Gtk.EventBox()
+        hold.set_visible_window(False)
+        hold.set_halign(Gtk.Align.CENTER)
+        hold.set_valign(Gtk.Align.CENTER)
+        hold.connect("button-press-event", lambda w, e: True)
+        self.card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self.card.get_style_context().add_class("card")
+        hold.add(self.card)
+        bg.add(hold)
+        self.add(bg)
+        self.connect("key-press-event", self.on_key)
+        self.fullscreen()
+
+    def on_key(self, w, ev):
+        k = Gdk.keyval_name(ev.keyval) or ""
+        if k == "Escape":
+            self.quit()
+            return True
+        return self.key(k, ev)
+
+    def key(self, name, ev):
+        return False
+
+    def quit(self):
+        self.destroy()
+
+
+def on_destroy(*_):
+    drop_lock()
+    Gtk.main_quit()
+
+
+def run(cls):
+    GLib.set_prgname(NAME)
+    GLib.set_application_name(NAME)
+    pid = running()
+    if pid:
+        try:
+            os.kill(pid, 15)
+        except OSError:
+            pass
+        drop_lock()
+        return
+    w = cls()
+    w.connect("destroy", on_destroy)
+    w.show_all()
+    try:
+        with open(LOCK, "w") as f:
+            f.write(str(os.getpid()))
+    except OSError:
+        pass
+    first = getattr(w, "first", None)
+    if first is not None:
+        first.grab_focus()
+    Gtk.main()
+
+
+EXTRA_CSS = b"""
+.wifi-list { background-color: transparent; }
+.wifi-list row { padding: 7px 10px; margin: 2px 0; border-radius: 10px; background-color: transparent; }
+.wifi-list row:hover { background-color: rgba(169,204,130,0.12); }
+.wifi-list row:focus, .wifi-list row:selected { background-color: rgba(169,204,130,0.20); }
+.wifi-list row.active { background-color: rgba(125,148,96,0.28); }
+.icon.weak { color: #75846d; }
+.icon.mid { color: #a8b8a0; }
+.icon.good { color: #a9cc82; }
+.icon.lock { color: #8a9a82; }
+.icon.mark { color: #a9cc82; }
+.status-card { background-color: rgba(169,204,130,0.06); border: 1px solid rgba(169,204,130,0.22);
+border-radius: 14px; padding: 10px 14px; }
+.big { color: #e4ebe2; font-size: 12px; }
+"""
+ENV = dict(os.environ, LC_ALL="C", LANG="C")
+WIFI, LOCK_I, CHECK, PLUG = "\uf1eb", "\uf023", "\uf00c", "\uf1e6"
+
+
+def nm_run(args, timeout=15):
+    try:
+        r = subprocess.run(["nmcli"] + args, capture_output=True, text=True, timeout=timeout, env=ENV)
+    except FileNotFoundError:
+        return 127, "", "nmcli не найден (нужен NetworkManager)"
+    except subprocess.TimeoutExpired:
+        return 124, "", "время ожидания истекло"
+    except Exception as e:
+        return 1, "", str(e)
+    return r.returncode, r.stdout, r.stderr.strip()
+
+
+def split_nm(line):
+    out, cur, i = [], "", 0
+    while i < len(line):
+        c = line[i]
+        if c == "\\" and i + 1 < len(line):
+            cur += line[i + 1]
+            i += 2
+            continue
+        if c == ":":
+            out.append(cur)
+            cur = ""
+        else:
+            cur += c
+        i += 1
+    out.append(cur)
+    return out
+
+
+def friendly(err):
+    e = (err or "").strip().splitlines()
+    text = e[-1] if e else "неизвестная ошибка"
+    low = text.lower()
+    if "no network with ssid" in low:
+        return "Сеть не найдена, обнови список"
+    if "secrets were required" in low or "password" in low or "802-1x" in low:
+        return "Неверный пароль или нужна авторизация"
+    if "timeout" in low or "time" in low and "expired" in low:
+        return "Не удалось подключиться за отведённое время"
+    return text
+
+
+def gather():
+    info = {"ok": True, "radio": True, "active": [], "wifi": [], "saved": set(), "err": "", "wdev": ""}
+    rc, out, err = nm_run(["-t", "-f", "RUNNING", "general"], 5)
+    if rc != 0 or out.strip() != "running":
+        info["ok"] = False
+        info["err"] = err or "NetworkManager не запущен"
+        return info
+    _, out, _ = nm_run(["radio", "wifi"], 5)
+    info["radio"] = out.strip() == "enabled"
+    _, out, _ = nm_run(["-t", "-f", "NAME,TYPE", "connection", "show"], 8)
+    for line in out.splitlines():
+        f = split_nm(line)
+        if len(f) >= 2 and f[1] == "802-11-wireless":
+            info["saved"].add(f[0])
+    wifi = []
+    if info["radio"]:
+        _, out, _ = nm_run(["-t", "-f", "IN-USE,SIGNAL,SECURITY,SSID", "device", "wifi", "list"], 20)
+        best = {}
+        for line in out.splitlines():
+            f = split_nm(line)
+            if len(f) < 4 or not f[3]:
+                continue
+            ssid = f[3]
+            try:
+                sig = int(f[1])
+            except ValueError:
+                sig = 0
+            item = {"ssid": ssid, "signal": sig, "secured": f[2] not in ("", "--"), "active": f[0] == "*"}
+            old = best.get(ssid)
+            if old is None or item["active"] or (not old["active"] and sig > old["signal"]):
+                best[ssid] = item
+        wifi = sorted(best.values(), key=lambda i: (not i["active"], -i["signal"], i["ssid"].lower()))
+    info["wifi"] = wifi
+    _, out, _ = nm_run(["-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device", "status"], 8)
+    for line in out.splitlines():
+        f = split_nm(line)
+        if len(f) < 4:
+            continue
+        dev, typ, state, conn = f[0], f[1], f[2], f[3]
+        if typ == "wifi" and not info["wdev"]:
+            info["wdev"] = dev
+        if state != "connected" or typ not in ("wifi", "ethernet"):
+            continue
+        ip = ""
+        _, o2, _ = nm_run(["-t", "-f", "IP4.ADDRESS", "device", "show", dev], 5)
+        for l2 in o2.splitlines():
+            p = split_nm(l2)
+            if len(p) >= 2 and p[1]:
+                ip = p[1].split("/")[0]
+                break
+        sig = next((w["signal"] for w in wifi if w["active"]), None) if typ == "wifi" else None
+        info["active"].append({"dev": dev, "type": typ, "name": conn, "ip": ip, "signal": sig})
+    return info
+
+
+class NetMenu(Overlay):
+    def __init__(self):
+        super().__init__(EXTRA_CSS)
+        self.first = None
+        self.busy = False
+        self.info = None
+        self.pending = None
+        self.skip_switch = False
+        self.note = None
+        card = self.card
+        card.set_spacing(10)
+        card.set_size_request(500, -1)
+        card.pack_start(label("Сеть", "title"), False, False, 0)
+
+        self.status_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.status_box.get_style_context().add_class("status-card")
+        card.pack_start(self.status_box, False, False, 0)
+
+        sw_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        sw_row.pack_start(label("Wi-Fi", "name", xalign=0), True, True, 0)
+        self.switch = Gtk.Switch()
+        self.switch.set_valign(Gtk.Align.CENTER)
+        self.switch.connect("notify::active", self.on_switch)
+        sw_row.pack_start(self.switch, False, False, 0)
+        card.pack_start(sw_row, False, False, 0)
+
+        card.pack_start(label("ДОСТУПНЫЕ СЕТИ", "sect", xalign=0), False, False, 0)
+        self.list = Gtk.ListBox()
+        self.list.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.list.set_activate_on_single_click(True)
+        self.list.get_style_context().add_class("wifi-list")
+        self.list.connect("row-activated", self.on_row)
+        sc = Gtk.ScrolledWindow()
+        sc.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        sc.set_min_content_height(120)
+        sc.set_max_content_height(280)
+        sc.set_propagate_natural_height(True)
+        sc.add(self.list)
+        card.pack_start(sc, False, False, 0)
+
+        # ввод пароля (появляется при выборе защищённой сети)
+        self.pw_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.pw_title = label("", "name", xalign=0)
+        self.pw_entry = Gtk.Entry()
+        self.pw_entry.set_visibility(False)
+        self.pw_entry.set_placeholder_text("Пароль")
+        self.pw_entry.connect("activate", lambda *_: self.submit_password())
+        pw_btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        ok = Gtk.Button(label="Подключить")
+        ok.connect("clicked", lambda *_: self.submit_password())
+        cancel = Gtk.Button(label="Отмена")
+        cancel.connect("clicked", lambda *_: self.hide_password())
+        show = Gtk.CheckButton(label="показать")
+        show.connect("toggled", lambda b: self.pw_entry.set_visibility(b.get_active()))
+        pw_btns.pack_start(ok, False, False, 0)
+        pw_btns.pack_start(cancel, False, False, 0)
+        pw_btns.pack_end(show, False, False, 0)
+        self.pw_box.pack_start(self.pw_title, False, False, 0)
+        self.pw_box.pack_start(self.pw_entry, False, False, 0)
+        self.pw_box.pack_start(pw_btns, False, False, 0)
+        card.pack_start(self.pw_box, False, False, 0)
+
+        self.msg = label("", "sub", xalign=0)
+        self.msg.set_line_wrap(True)
+        self.msg.set_max_width_chars(60)
+        card.pack_start(self.msg, False, False, 0)
+
+        btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.b_refresh = Gtk.Button(label="Обновить")
+        self.b_refresh.connect("clicked", lambda *_: self.refresh(True))
+        self.b_disc = Gtk.Button(label="Отключиться от Wi-Fi")
+        self.b_disc.connect("clicked", lambda *_: self.leave())
+        btns.pack_start(self.b_refresh, False, False, 0)
+        btns.pack_start(self.b_disc, False, False, 0)
+        card.pack_start(btns, False, False, 0)
+        card.pack_start(label("клик по сети - подключиться    Esc  закрыть", "hint"), False, False, 4)
+        self.first = self.b_refresh
+        GLib.idle_add(self.pw_box.hide)
+        GLib.idle_add(self.refresh, False)
+
+    # ---------- сообщения ----------
+    def say(self, text, kind="sub"):
+        ctx = self.msg.get_style_context()
+        for c in ("sub", "err", "ok"):
+            ctx.remove_class(c)
+        ctx.add_class(kind)
+        self.msg.set_text(text)
+        return False
+
+    # ---------- обновление ----------
+    def refresh(self, rescan=False):
+        if self.busy:
+            return False
+        self.busy = True
+        self.say("Ищу сети…" if rescan else "Обновляю…")
+
+        def work():
+            if rescan:
+                nm_run(["device", "wifi", "rescan"], 10)
+                time.sleep(2.5)
+            info = gather()
+            GLib.idle_add(self.apply, info)
+        threading.Thread(target=work, daemon=True).start()
+        return False
+
+    def apply(self, info):
+        self.busy = False
+        self.info = info
+        for c in self.status_box.get_children():
+            self.status_box.remove(c)
+        if not info["ok"]:
+            self.status_box.pack_start(label("Нет связи с NetworkManager", "big", xalign=0), False, False, 0)
+            self.status_box.pack_start(label(info["err"], "err", xalign=0), False, False, 0)
+        elif not info["active"]:
+            self.status_box.pack_start(label("Нет подключения", "big", xalign=0), False, False, 0)
+            self.status_box.pack_start(label("выбери сеть ниже", "sub", xalign=0), False, False, 0)
+        for a in info["active"]:
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+            row.pack_start(Glyph(WIFI if a["type"] == "wifi" else PLUG, 18, 30, 30, "good"), False, False, 0)
+            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            kind = "Wi-Fi" if a["type"] == "wifi" else "Проводное соединение"
+            col.pack_start(label(f"{kind} · {a['name']}", "big", xalign=0), False, False, 0)
+            bits = []
+            if a["ip"]:
+                bits.append("IP " + a["ip"])
+            if a["signal"] is not None:
+                bits.append(f"сигнал {a['signal']}%")
+            if a["type"] == "ethernet":
+                bits.append(a["dev"])
+            col.pack_start(label("  ·  ".join(bits) or "подключено", "sub", xalign=0), False, False, 0)
+            row.pack_start(col, True, True, 0)
+            self.status_box.pack_start(row, False, False, 0)
+        self.status_box.show_all()
+
+        self.skip_switch = True
+        self.switch.set_active(info["radio"])
+        self.skip_switch = False
+        self.switch.set_sensitive(info["ok"])
+
+        for c in self.list.get_children():
+            self.list.remove(c)
+        for w in info["wifi"]:
+            self.list.add(self.make_row(w))
+        self.list.show_all()
+        self.b_disc.set_sensitive(any(a["type"] == "wifi" for a in info["active"]))
+        if self.note:
+            self.say(*self.note)
+            self.note = None
+        elif not info["ok"]:
+            self.say("")
+        elif not info["radio"]:
+            self.say("Wi-Fi выключен")
+        elif not info["wifi"]:
+            self.say("Сети не найдены (нет Wi-Fi адаптера или нужно обновить)")
+        else:
+            self.say(f"Найдено сетей: {len(info['wifi'])}")
+        return False
+
+    def make_row(self, w):
+        row = Gtk.ListBoxRow()
+        row.ssid, row.secured, row.is_active = w["ssid"], w["secured"], w["active"]
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        s = w["signal"]
+        cls = "good" if s >= 60 else ("mid" if s >= 35 else "weak")
+        box.pack_start(Glyph(WIFI, 14, 24, 20, cls), False, False, 0)
+        name = label(w["ssid"], "name", xalign=0)
+        name.set_ellipsize(Pango.EllipsizeMode.END)
+        name.set_max_width_chars(30)
+        box.pack_start(name, True, True, 0)
+        if w["secured"]:
+            box.pack_start(Glyph(LOCK_I, 11, 18, 18, "lock"), False, False, 0)
+        if w["active"]:
+            box.pack_start(Glyph(CHECK, 12, 18, 18, "mark"), False, False, 0)
+            row.get_style_context().add_class("active")
+        box.pack_start(label(f"{s}%", "pct", xalign=1, chars=4), False, False, 0)
+        row.add(box)
+        return row
+
+    # ---------- действия ----------
+    def on_switch(self, sw, _p):
+        if self.skip_switch:
+            return
+        state = "on" if sw.get_active() else "off"
+        self.say("Включаю Wi-Fi…" if state == "on" else "Выключаю Wi-Fi…")
+
+        def work():
+            nm_run(["radio", "wifi", state], 10)
+            time.sleep(1.5 if state == "on" else 0.3)
+            GLib.idle_add(self.after_toggle)
+        threading.Thread(target=work, daemon=True).start()
+
+    def after_toggle(self):
+        self.busy = False
+        self.refresh(False)
+        return False
+
+    def on_row(self, box, row):
+        if self.busy or row.is_active:
+            return
+        ssid = row.ssid
+        if ssid in (self.info or {}).get("saved", set()):
+            self.join(ssid, None, True)
+        elif not row.secured:
+            self.join(ssid, None, False)
+        else:
+            self.show_password(ssid)
+
+    def show_password(self, ssid):
+        self.pending = ssid
+        self.pw_title.set_text(f"Пароль для «{ssid}»")
+        self.pw_entry.set_text("")
+        self.pw_box.show_all()
+        self.pw_entry.grab_focus()
+
+    def hide_password(self):
+        self.pending = None
+        self.pw_box.hide()
+        self.list.grab_focus()
+
+    def submit_password(self):
+        pw = self.pw_entry.get_text()
+        ssid = self.pending
+        if not ssid or not pw:
+            return
+        self.pw_box.hide()
+        self.join(ssid, pw, False)
+
+    def join(self, ssid, password, saved):
+        if self.busy:
+            return
+        self.busy = True
+        self.say(f"Подключаюсь к «{ssid}»…")
+
+        def work():
+            if password:
+                rc, _, err = nm_run(["device", "wifi", "connect", ssid, "password", password], 45)
+                if rc != 0:
+                    nm_run(["connection", "delete", "id", ssid], 8)  # не оставлять битый профиль
+            elif saved:
+                rc, _, err = nm_run(["connection", "up", "id", ssid], 45)
+            else:
+                rc, _, err = nm_run(["device", "wifi", "connect", ssid], 45)
+                if rc != 0:
+                    nm_run(["connection", "delete", "id", ssid], 8)
+            GLib.idle_add(self.after_join, ssid, rc, err, saved)
+        threading.Thread(target=work, daemon=True).start()
+
+    def after_join(self, ssid, rc, err, saved):
+        self.busy = False
+        if rc == 0:
+            self.note = (f"Подключено: {ssid}", "ok")
+        else:
+            text = friendly(err)
+            if saved and "пароль" in text.lower():
+                self.show_password(ssid)
+            self.note = (f"{ssid}: {text}", "err")
+        self.refresh(False)
+        return False
+
+    def leave(self):
+        if self.busy or not self.info:
+            return
+        dev = next((a["dev"] for a in self.info["active"] if a["type"] == "wifi"), "")
+        if not dev:
+            return
+        self.busy = True
+        self.say("Отключаюсь…")
+
+        def work():
+            rc, _, err = nm_run(["device", "disconnect", dev], 15)
+            GLib.idle_add(self.after_leave, rc, err)
+        threading.Thread(target=work, daemon=True).start()
+
+    def after_leave(self, rc, err):
+        self.busy = False
+        if rc != 0:
+            self.note = (friendly(err), "err")
+        self.refresh(False)
+        return False
+
+
+if __name__ == "__main__":
+    run(NetMenu)
+EOF
+chmod 755 /usr/local/bin/network-menu
+
+cat > /usr/local/bin/year-calendar <<'EOF'
+#!/usr/bin/python3
+import json
+import os
+import re
+import subprocess
+import threading
+import time
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, GLib, Gtk, Pango
+
+NAME = "year-calendar"
+LOCK = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), NAME + ".pid")
+FA_FONT = "FontAwesome"
+BASE_CSS = b"""
+* { font-family: "DejaVu Sans Mono", "FontAwesome", monospace; }
+window { background-color: rgba(4,7,5,0.60); }
+.card { background-color: rgba(15,20,16,0.90); border: 1px solid rgba(169,204,130,0.45);
+border-radius: 20px; padding: 20px 24px 14px 24px; }
+.title { color: #e4ebe2; font-size: 14px; }
+.sub { color: #8a9a82; font-size: 10px; }
+.sect { color: #8a9a82; font-size: 9px; }
+.name { color: #e4ebe2; font-size: 11px; }
+.pct { color: #a8b8a0; font-size: 10px; }
+.err { color: #d98b7d; font-size: 10px; }
+.ok { color: #a9cc82; font-size: 10px; }
+.hint { color: #75846d; font-size: 9px; }
+button { background-image: none; background-color: rgba(169,204,130,0.06); color: #e4ebe2;
+border: 1px solid rgba(169,204,130,0.25); border-radius: 12px; box-shadow: none;
+padding: 2px 10px; min-height: 0; min-width: 0; }
+button:hover, button:focus { background-color: rgba(169,204,130,0.18); border-color: #a9cc82; }
+button.off { color: #d98b7d; border-color: rgba(217,139,125,0.45); }
+entry { background-image: none; background-color: rgba(169,204,130,0.06); color: #e4ebe2;
+border: 1px solid rgba(169,204,130,0.25); border-radius: 12px; box-shadow: none; padding: 3px 10px; min-height: 0; }
+entry:focus { border-color: #a9cc82; }
+scale trough { background-color: rgba(169,204,130,0.18); background-image: none; border: none;
+border-radius: 4px; min-height: 6px; }
+scale highlight { background-color: #a9cc82; background-image: none; border: none; border-radius: 4px; }
+scale slider { background-color: #e4ebe2; background-image: none; border: none; box-shadow: none;
+border-radius: 50%; min-width: 16px; min-height: 16px; margin: -5px; }
+scale.muted highlight { background-color: #75846d; }
+scale.muted slider { background-color: #a8b8a0; }
+scrolledwindow, viewport { background-color: transparent; }
+scrollbar slider { background-color: rgba(169,204,130,0.35); border-radius: 4px; min-width: 6px; min-height: 6px; margin: 0; }
+scrollbar { background: transparent; border: none; }
+"""
+
+
+def running():
+    try:
+        with open(LOCK) as f:
+            pid = int(f.read().strip())
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return pid if NAME.encode() in f.read() else 0
+    except Exception:
+        return 0
+
+
+def drop_lock():
+    try:
+        os.remove(LOCK)
+    except OSError:
+        pass
+
+
+def apply_css(screen, css):
+    for rule in re.findall(rb"[^{}]+\{[^{}]*\}", css):
+        prov = Gtk.CssProvider()
+        try:
+            prov.load_from_data(rule)
+        except GLib.Error:
+            continue
+        Gtk.StyleContext.add_provider_for_screen(screen, prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+
+def label(text, cls=None, xalign=0.5, chars=None):
+    lab = Gtk.Label(label=text, xalign=xalign)
+    if cls:
+        lab.get_style_context().add_class(cls)
+    if chars:
+        lab.set_width_chars(chars)
+    return lab
+
+
+class Glyph(Gtk.DrawingArea):
+    # иконка рисуется по центру реального контура глифа, а не по рамке строки,
+    # поэтому боковые отступы шрифта не сдвигают её вправо
+    def __init__(self, text, size, w=40, h=30, cls=None):
+        super().__init__()
+        self.text, self.size = text, size
+        self.set_size_request(w, h)
+        self.set_halign(Gtk.Align.CENTER)
+        self.set_valign(Gtk.Align.CENTER)
+        ctx = self.get_style_context()
+        ctx.add_class("icon")
+        if cls:
+            ctx.add_class(cls)
+        self.connect("draw", self.on_draw)
+
+    def set_text(self, text):
+        self.text = text
+        self.queue_draw()
+
+    def on_draw(self, widget, cr):
+        alloc = widget.get_allocation()
+        layout = widget.create_pango_layout(self.text)
+        fd = Pango.FontDescription()
+        fd.set_family(FA_FONT + ",Symbols Nerd Font Mono,Symbols Nerd Font")
+        fd.set_absolute_size(self.size * Pango.SCALE)
+        layout.set_font_description(fd)
+        ink, _logical = layout.get_pixel_extents()
+        x = round((alloc.width - ink.width) / 2 - ink.x)
+        y = round((alloc.height - ink.height) / 2 - ink.y)
+        Gtk.render_layout(widget.get_style_context(), cr, x, y, layout)
+        return False
+
+
+def sh(args, timeout=3, env=None):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=env)
+    except Exception:
+        return None
+
+
+def fire(args):
+    threading.Thread(target=sh, args=(args,), daemon=True).start()
+
+
+class Overlay(Gtk.Window):
+    def __init__(self, extra_css=b""):
+        super().__init__(title=NAME)
+        self.set_decorated(False)
+        screen = self.get_screen()
+        visual = screen.get_rgba_visual()
+        if visual:
+            self.set_visual(visual)
+        apply_css(screen, BASE_CSS + extra_css)
+        bg = Gtk.EventBox()
+        bg.set_visible_window(False)
+        bg.connect("button-press-event", lambda w, e: self.quit())
+        hold = Gtk.EventBox()
+        hold.set_visible_window(False)
+        hold.set_halign(Gtk.Align.CENTER)
+        hold.set_valign(Gtk.Align.CENTER)
+        hold.connect("button-press-event", lambda w, e: True)
+        self.card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        self.card.get_style_context().add_class("card")
+        hold.add(self.card)
+        bg.add(hold)
+        self.add(bg)
+        self.connect("key-press-event", self.on_key)
+        self.fullscreen()
+
+    def on_key(self, w, ev):
+        k = Gdk.keyval_name(ev.keyval) or ""
+        if k == "Escape":
+            self.quit()
+            return True
+        return self.key(k, ev)
+
+    def key(self, name, ev):
+        return False
+
+    def quit(self):
+        self.destroy()
+
+
+def on_destroy(*_):
+    drop_lock()
+    Gtk.main_quit()
+
+
+def run(cls):
+    GLib.set_prgname(NAME)
+    GLib.set_application_name(NAME)
+    pid = running()
+    if pid:
+        try:
+            os.kill(pid, 15)
+        except OSError:
+            pass
+        drop_lock()
+        return
+    w = cls()
+    w.connect("destroy", on_destroy)
+    w.show_all()
+    try:
+        with open(LOCK, "w") as f:
+            f.write(str(os.getpid()))
+    except OSError:
+        pass
+    first = getattr(w, "first", None)
+    if first is not None:
+        first.grab_focus()
+    Gtk.main()
+
+
+import calendar
+import datetime
+
+EXTRA_CSS = b"""
+.ycard { padding: 18px 24px 14px 24px; }
+.year { color: #e4ebe2; font-size: 20px; }
+.mon { background-color: rgba(169,204,130,0.04); border: 1px solid rgba(169,204,130,0.15);
+border-radius: 14px; padding: 8px 10px 8px 10px; }
+.mon.cur { border-color: rgba(169,204,130,0.55); background-color: rgba(169,204,130,0.08); }
+.mtitle { color: #a9cc82; font-size: 12px; }
+.mon.cur .mtitle { color: #c4dfa0; }
+.wd { color: #8a9a82; font-size: 9px; }
+.wd.we { color: #b07d74; }
+.day { color: #e4ebe2; font-size: 11px; border-radius: 11px; }
+.day.we { color: #d98b7d; }
+.day.today { background-color: #a9cc82; color: #0f1410; }
+button.nav { padding: 2px 8px; }
+"""
+MONTHS = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+          "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
+WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+LEFT, RIGHT = "\uf053", "\uf054"
+
+
+def screen_height():
+    try:
+        disp = Gdk.Display.get_default()
+        mon = disp.get_primary_monitor() or disp.get_monitor(0)
+        return mon.get_geometry().height
+    except Exception:
+        return 1080
+
+
+class YearCal(Overlay):
+    def __init__(self):
+        super().__init__(EXTRA_CSS)
+        self.first = None
+        self.today = datetime.date.today()
+        self.year = self.today.year
+        tall = screen_height() >= 900
+        self.dw, self.dh = (28, 22) if tall else (24, 18)
+        card = self.card
+        card.get_style_context().add_class("ycard")
+        card.set_spacing(12)
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        self.b_prev = self.nav_button(LEFT, -1)
+        self.b_next = self.nav_button(RIGHT, 1)
+        self.year_lbl = label("", "year")
+        today_btn = Gtk.Button(label="Сегодня")
+        today_btn.connect("clicked", lambda *_: self.go_today())
+        head.pack_start(self.b_prev, False, False, 0)
+        head.pack_start(self.year_lbl, False, False, 6)
+        head.pack_start(self.b_next, False, False, 0)
+        head.pack_end(today_btn, False, False, 0)
+        card.pack_start(head, False, False, 0)
+        self.holder = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        card.pack_start(self.holder, False, False, 0)
+        card.pack_start(label("← →  год    Home  сегодня    Esc  закрыть", "hint"), False, False, 0)
+        self.first = today_btn
+        self.render_year()
+
+    def nav_button(self, glyph, step):
+        b = Gtk.Button()
+        b.get_style_context().add_class("nav")
+        b.add(Glyph(glyph, 13, 22, 22))
+        b.connect("clicked", lambda *_: self.shift(step))
+        return b
+
+    def shift(self, step):
+        y = self.year + step
+        if 1 <= y <= 9998:
+            self.year = y
+            self.render_year()
+
+    def go_today(self):
+        self.year = self.today.year
+        self.render_year()
+
+    def key(self, name, ev):
+        if name in ("Left", "Page_Up", "Up"):
+            self.shift(-1)
+        elif name in ("Right", "Page_Down", "Down"):
+            self.shift(1)
+        elif name == "Home":
+            self.go_today()
+        else:
+            return False
+        return True
+
+    def render_year(self):
+        for c in self.holder.get_children():
+            self.holder.remove(c)
+            c.destroy()
+        grid = Gtk.Grid()
+        grid.set_column_spacing(14)
+        grid.set_row_spacing(14)
+        grid.set_column_homogeneous(True)
+        for m in range(1, 13):
+            grid.attach(self.month(m), (m - 1) % 4, (m - 1) // 4, 1, 1)
+        self.holder.pack_start(grid, False, False, 0)
+        self.year_lbl.set_text(str(self.year))
+        self.holder.show_all()
+
+    def month(self, m):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        ctx = box.get_style_context()
+        ctx.add_class("mon")
+        if (self.year, m) == (self.today.year, self.today.month):
+            ctx.add_class("cur")
+        box.pack_start(label(MONTHS[m - 1], "mtitle", xalign=0), False, False, 0)
+        g = Gtk.Grid()
+        g.set_column_spacing(2)
+        g.set_row_spacing(2)
+        for i, w in enumerate(WEEKDAYS):
+            lab = label(w, "wd")
+            if i >= 5:
+                lab.get_style_context().add_class("we")
+            lab.set_size_request(self.dw, 16)
+            g.attach(lab, i, 0, 1, 1)
+        weeks = calendar.monthcalendar(self.year, m)
+        while len(weeks) < 6:
+            weeks.append([0] * 7)
+        for r, wk in enumerate(weeks):
+            for c, d in enumerate(wk):
+                lab = label(str(d) if d else "", "day")
+                lab.set_size_request(self.dw, self.dh)
+                lc = lab.get_style_context()
+                if c >= 5:
+                    lc.add_class("we")
+                if d and datetime.date(self.year, m, d) == self.today:
+                    lc.add_class("today")
+                g.attach(lab, c, r + 1, 1, 1)
+        box.pack_start(g, False, False, 0)
+        return box
+
+
+if __name__ == "__main__":
+    run(YearCal)
+EOF
+chmod 755 /usr/local/bin/year-calendar
+
+cat > /usr/local/bin/volume-click <<'EOF'
+#!/bin/sh
+# одиночный клик по значку громкости - вкл/выкл звук; быстрый двойной - меню громкости
+f="${XDG_RUNTIME_DIR:-/tmp}/volume-click.ts"
+now=$(date +%s%N)
+if [ -f "$f" ]; then
+  prev=$(cat "$f" 2>/dev/null)
+  case "$prev" in ''|*[!0-9]*) prev=0 ;; esac
+  if [ $((now - prev)) -lt 450000000 ]; then
+    rm -f "$f"
+    exec /usr/local/bin/audio-menu
+  fi
+fi
+echo "$now" > "$f"
+sleep 0.45
+if [ "$(cat "$f" 2>/dev/null)" = "$now" ]; then
+  rm -f "$f"
+  wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle
+fi
+EOF
+chmod 755 /usr/local/bin/volume-click
 
 cat > /usr/local/bin/performance-status <<'EOF'
 #!/usr/bin/python3
@@ -1889,6 +3456,10 @@ hl.bind("XF86MonBrightnessDown", hl.dsp.exec_cmd("brightnessctl set 5%-"), { loc
 
 hl.window_rule({ name = "float-wofi", match = { class = "^(wofi)$" }, float = true })
 hl.window_rule({ name = "float-power-menu", match = { class = "^(power-menu)$" }, float = true })
+hl.window_rule({ name = "float-performance-menu", match = { class = "^(performance-menu)$" }, float = true })
+hl.window_rule({ name = "float-audio-menu", match = { class = "^(audio-menu)$" }, float = true })
+hl.window_rule({ name = "float-network-menu", match = { class = "^(network-menu)$" }, float = true })
+hl.window_rule({ name = "float-year-calendar", match = { class = "^(year-calendar)$" }, float = true })
 EOF
 
 # ---------- alacritty ----------
@@ -1928,8 +3499,8 @@ w "$H/.config/waybar/config.jsonc" <<'EOF'
   "height": 32,
   "spacing": 4,
   "modules-left": ["custom/launcher", "hyprland/workspaces"],
-  "modules-center": ["clock"],
-  "modules-right": ["hyprland/language", "pulseaudio", "backlight", "battery", "custom/performance"],
+  "modules-center": ["clock#time", "clock#date"],
+  "modules-right": ["hyprland/language", "network", "pulseaudio", "backlight", "battery", "custom/performance"],
   "custom/launcher": {
     "format": "◈",
     "tooltip": true,
@@ -1945,8 +3516,8 @@ w "$H/.config/waybar/config.jsonc" <<'EOF'
       "*": 5
     }
   },
-  "clock": {
-    "format": "󰥔  {:%H:%M  ·  %a %d %b}",
+  "clock#time": {
+    "format": "󰥔  {:%H:%M}",
     "tooltip": true,
     "tooltip-format": "<tt><small>{calendar}</small></tt>",
     "calendar": {
@@ -1969,19 +3540,57 @@ w "$H/.config/waybar/config.jsonc" <<'EOF'
       "on-scroll-down": "shift_down"
     }
   },
+  "clock#date": {
+    "format": "{:%a %d %b}",
+    "tooltip": true,
+    "tooltip-format": "<tt><small>{calendar}</small></tt>",
+    "calendar": {
+      "mode": "month",
+      "mode-mon-col": 3,
+      "weeks-pos": "right",
+      "on-scroll": 1,
+      "format": {
+        "months": "<span color='#c4dfa0'><b>{}</b></span>",
+        "days": "<span color='#e4ebe2'>{}</span>",
+        "weeks": "<span color='#6e944f'>W{}</span>",
+        "weekdays": "<span color='#a9cc82'><b>{}</b></span>",
+        "today": "<span color='#c4dfa0'><b><u>{}</u></b></span>"
+      }
+    },
+    "actions": {
+      "on-click-right": "shift_reset",
+      "on-scroll-up": "shift_up",
+      "on-scroll-down": "shift_down"
+    },
+    "on-click": "/usr/local/bin/year-calendar"
+  },
   "hyprland/language": {
-    "format": "  {short}",
+    "format": "󰌌  {short}",
     "tooltip": true
+  },
+  "network": {
+    "format-wifi": "{icon}  {essid}",
+    "format-ethernet": "󰈀  Кабель",
+    "format-linked": "󰈀  Нет IP",
+    "format-disconnected": "󰤮  Нет сети",
+    "format-disabled": "󰤮  Выкл",
+    "format-icons": ["󰤯", "󰤟", "󰤢", "󰤥", "󰤨"],
+    "tooltip-format-wifi": "{essid} · {signalStrength}%\n{ipaddr}",
+    "tooltip-format-ethernet": "{ifname}\n{ipaddr}",
+    "tooltip-format-disconnected": "Нет подключения",
+    "max-length": 22,
+    "interval": 5,
+    "on-click": "/usr/local/bin/network-menu"
   },
   "pulseaudio": {
     "format": "{icon}  {volume}%",
     "format-muted": "󰖁  0%",
     "format-icons": {
-      "default": ["", "", ""]
+      "default": ["󰕿", "󰖀", "󰕾"]
     },
     "scroll-step": 5,
     "max-volume": 100,
-    "on-click": "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle",
+    "on-click": "/usr/local/bin/volume-click",
     "on-scroll-up": "wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 5%+",
     "on-scroll-down": "wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-"
   },
@@ -2019,16 +3628,21 @@ window#waybar { background: rgba(15, 20, 16, 0.92); color: #e4ebe2; border-botto
 #workspaces button.active { background: #a9cc82; color: #0f1410; font-weight: 700; }
 #workspaces button:hover { background: rgba(169, 204, 130, 0.18); color: #e4ebe2; }
 #workspaces button.urgent { background: #d98b7d; color: #0f1410; font-weight: 700; }
-#clock { color: #e4ebe2; font-size: 13.5px; font-weight: 700; padding: 0 14px; letter-spacing: 0.2px; }
-#language, #pulseaudio, #backlight, #battery, #custom-performance { background: rgba(169, 204, 130, 0.06); color: #e4ebe2; border: 1px solid rgba(169, 204, 130, 0.25); border-radius: 6px; padding: 0 9px; margin: 4px 2px; }
+#clock { color: #e4ebe2; font-size: 13.5px; font-weight: 700; padding: 0 6px; letter-spacing: 0.2px; }
+#clock.time { padding: 0 2px 0 14px; }
+#clock.date { color: #a8b8a0; font-size: 12.5px; font-weight: 600; padding: 0 12px 0 8px; margin: 4px 2px; border-radius: 6px; }
+#clock.date:hover { background: rgba(169, 204, 130, 0.18); color: #e4ebe2; }
+#language, #network, #pulseaudio, #backlight, #battery, #custom-performance { background: rgba(169, 204, 130, 0.06); color: #e4ebe2; border: 1px solid rgba(169, 204, 130, 0.25); border-radius: 6px; padding: 0 9px; margin: 4px 2px; }
 #language { color: #dfe8d8; }
 #pulseaudio.muted { color: #8a9a82; }
 #battery.warning { color: #d8b76c; border-color: rgba(216, 183, 108, 0.45); }
 #battery.critical { color: #d98b7d; border-color: rgba(217, 139, 125, 0.45); }
 #custom-performance { color: #c4dfa0; padding: 0 10px; margin-right: 8px; }
-#custom-performance:hover, #language:hover, #pulseaudio:hover, #backlight:hover, #battery:hover { background: rgba(169, 204, 130, 0.18); border-color: rgba(169, 204, 130, 0.55); }
+#custom-performance:hover, #language:hover, #network:hover, #pulseaudio:hover, #backlight:hover, #battery:hover { background: rgba(169, 204, 130, 0.18); border-color: rgba(169, 204, 130, 0.55); }
 tooltip { background: rgb(20, 27, 22); border: 1px solid rgba(169, 204, 130, 0.45); border-radius: 8px; color: #e4ebe2; padding: 6px 10px; }
 tooltip label { color: #e4ebe2; }
+#network.disconnected, #network.disabled { color: #d98b7d; }
+#network.ethernet { color: #c4dfa0; }
 EOF
 
 # ---------- wofi ----------
@@ -2153,6 +3767,7 @@ mkdir -p "$H/Pictures/wall"
 FA="$(fc-list : family 2>/dev/null | grep -o 'Font Awesome [0-9]* Free' | head -n1 || true)"
 FA="${FA:-Font Awesome 7 Free} Solid"
 sed -i "s/FontAwesome/$FA/g" /usr/local/bin/power-menu /usr/local/bin/performance-menu \
+  /usr/local/bin/audio-menu /usr/local/bin/network-menu /usr/local/bin/year-calendar \
   "$H/.config/waybar/style.css"
 
 chown -R "$U:$G" "$H/.config" "$H/.local" "$H/Pictures" "$H/.bashrc" "$H/.bash_profile" 2>/dev/null || true
@@ -2254,7 +3869,7 @@ install_opencode
 gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor 2>/dev/null || true
 
 # ================= wofi: в лаунчере только твои приложения =================
-allow="$( { for p in steam telegram-desktop prismlauncher happ firefox photocraft; do pacman -Ql "$p" 2>/dev/null; done \
+allow="$( { for p in steam telegram-desktop happ firefox photocraft; do pacman -Ql "$p" 2>/dev/null; done \
   | awk '{print $2}' | grep '^/usr/share/applications/.*\.desktop$' | while read -r f; do basename "$f"; done
   printf '%s\n' onlyoffice.desktop photocraft.desktop limusic.desktop opencode.desktop; } )"
 mkdir -p "$H/.local/share/applications"
