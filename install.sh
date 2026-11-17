@@ -23,11 +23,11 @@ nv="$(pacman -Qq 2>/dev/null | grep -E '^(nvidia|lib32-nvidia|opencl-nvidia|lib3
 [ -z "$nv" ] || pacman -Rns --noconfirm $nv || true
 pacman -S --noconfirm --needed \
   hyprland hyprland-guiutils xdg-desktop-portal-hyprland xorg-xwayland qt6-wayland \
-  alacritty waybar wofi swaybg \
+  alacritty waybar wofi swaybg hyprsunset \
   pipewire pipewire-pulse wireplumber \
   brightnessctl grim slurp wl-clipboard \
   ttf-dejavu ttf-font-awesome noto-fonts-emoji papirus-icon-theme adwaita-icon-theme lxqt-policykit ttf-jetbrains-mono-nerd ttf-nerd-fonts-symbols \
-  python-gobject gtk3 mesa vulkan-intel power-profiles-daemon libpulse networkmanager udisks2 xdg-utils xdg-user-dirs \
+  python-gobject python-cairo gtk3 mesa vulkan-intel power-profiles-daemon libpulse networkmanager gtk-layer-shell udisks2 xdg-utils xdg-user-dirs \
   fastfetch chafa cava nano curl \
   firefox firefox-i18n-ru telegram-desktop \
   jre21-openjdk
@@ -1739,274 +1739,10 @@ if __name__ == "__main__":
 EOF
 chmod 755 /usr/local/bin/power-menu
 
-# ---------- меню производительности (профили питания) ----------
-cat > /usr/local/bin/performance-menu <<'EOF'
-#!/usr/bin/python3
-import os
-import re
-import subprocess
-import gi
-gi.require_version("Gtk", "3.0")
-gi.require_version("Gdk", "3.0")
-from gi.repository import Gdk, GLib, Gtk, Pango
-
-LOCK = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "performance-menu.pid")
-CSS = b"""
-* { font-family: "DejaVu Sans Mono", "FontAwesome", monospace; }
-window { background-color: rgba(4,7,5,0.60); }
-.card { background-color: rgba(15,20,16,0.88); border: 1px solid rgba(169,204,130,0.45);
-border-radius: 20px; padding: 22px 24px 14px 24px; }
-.title { color: #e4ebe2; font-size: 14px; }
-.sub { color: #8a9a82; font-size: 10px; }
-button { background-image: none; background-color: rgba(169,204,130,0.06); color: #e4ebe2;
-border: 1px solid rgba(169,204,130,0.25); border-radius: 16px; box-shadow: none; padding: 0; }
-button:hover, button:focus { background-color: rgba(169,204,130,0.18); border-color: #a9cc82; }
-button.active { background-color: rgba(110,148,79,0.35); border-color: #a9cc82; }
-button:disabled { opacity: 0.35; }
-.icon { font-size: 30px; color: #a9cc82; }
-button.perf .icon { color: #d8b76c; }
-.name { font-size: 12px; }
-.desc { color: #8a9a82; font-size: 9px; }
-.key { color: #75846d; font-size: 9px; }
-.err { color: #d98b7d; font-size: 10px; }
-.hint { color: #75846d; font-size: 9px; }
-"""
-
-PROFILES = (
-    ("power-saver", "\uf06c", "Энергосбережение", "тише и дольше от батареи", "1", False),
-    ("balanced", "\uf24e", "Баланс", "на каждый день", "2", False),
-    ("performance", "\uf0e7", "Производительность", "максимум мощности", "3", True),
-)
-
-
-def ppd(*args):
-    return subprocess.run(["powerprofilesctl", *args], capture_output=True, text=True, timeout=5)
-
-
-def state():
-    # (текущий профиль, множество доступных профилей); при сбое (None, пусто)
-    try:
-        cur = ppd("get")
-        lst = ppd("list")
-        if cur.returncode != 0 or lst.returncode != 0:
-            return None, set()
-        names = set(re.findall(r"^\s*\*?\s*([a-z-]+):\s*$", lst.stdout, re.M))
-        return cur.stdout.strip(), names
-    except Exception:
-        return None, set()
-
-
-def running():
-    try:
-        with open(LOCK) as f:
-            pid = int(f.read().strip())
-        with open(f"/proc/{pid}/cmdline", "rb") as f:
-            return pid if b"performance-menu" in f.read() else 0
-    except Exception:
-        return 0
-
-
-def drop_lock():
-    try:
-        os.remove(LOCK)
-    except OSError:
-        pass
-
-
-FA_FONT = "FontAwesome"
-
-
-class Glyph(Gtk.DrawingArea):
-    # иконка рисуется по центру реального контура глифа, а не по рамке строки,
-    # поэтому боковые отступы шрифта не сдвигают её вправо
-    def __init__(self, text, size, w=56, h=44):
-        super().__init__()
-        self.text, self.size = text, size
-        self.set_size_request(w, h)
-        self.set_halign(Gtk.Align.CENTER)
-        self.get_style_context().add_class("icon")
-        self.connect("draw", self.on_draw)
-
-    def on_draw(self, widget, cr):
-        alloc = widget.get_allocation()
-        layout = widget.create_pango_layout(self.text)
-        fd = Pango.FontDescription()
-        fd.set_family(FA_FONT + ",Symbols Nerd Font Mono,Symbols Nerd Font")
-        fd.set_absolute_size(self.size * Pango.SCALE)
-        layout.set_font_description(fd)
-        ink, _logical = layout.get_pixel_extents()
-        x = round((alloc.width - ink.width) / 2 - ink.x)
-        y = round((alloc.height - ink.height) / 2 - ink.y)
-        Gtk.render_layout(widget.get_style_context(), cr, x, y, layout)
-        return False
-
-
-class PerfMenu(Gtk.Window):
-    def __init__(self):
-        super().__init__(title="performance-menu")
-        self.set_decorated(False)
-        screen = self.get_screen()
-        visual = screen.get_rgba_visual()
-        if visual:
-            self.set_visual(visual)
-        for rule in re.findall(rb"[^{}]+\{[^{}]*\}", CSS):
-            prov = Gtk.CssProvider()
-            try:
-                prov.load_from_data(rule)
-            except GLib.Error:
-                continue
-            Gtk.StyleContext.add_provider_for_screen(screen, prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
-        cur, avail = state()
-        bg = Gtk.EventBox()
-        bg.set_visible_window(False)
-        bg.connect("button-press-event", lambda w, e: self.quit())
-        hold = Gtk.EventBox()
-        hold.set_visible_window(False)
-        hold.set_halign(Gtk.Align.CENTER)
-        hold.set_valign(Gtk.Align.CENTER)
-        hold.connect("button-press-event", lambda w, e: True)
-        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
-        card.get_style_context().add_class("card")
-        title = Gtk.Label(label="Профиль питания")
-        title.get_style_context().add_class("title")
-        card.pack_start(title, False, False, 0)
-        self.sub = Gtk.Label(label="")
-        card.pack_start(self.sub, False, False, 0)
-        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-        self.buttons = []
-        self.keys = {}
-        focus = None
-        for prof, icon, name, desc, key, perf in PROFILES:
-            b = Gtk.Button()
-            b.set_size_request(176, 128)
-            ctx = b.get_style_context()
-            if perf:
-                ctx.add_class("perf")
-            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-            col.set_valign(Gtk.Align.CENTER)
-            is_cur = prof == cur
-            key_text = key + ("  \u00b7  сейчас" if is_cur else "")
-            col.pack_start(Glyph(icon, 30), False, False, 0)
-            for text, cls in ((name, "name"), (desc, "desc"), (key_text, "key")):
-                lab = Gtk.Label(label=text)
-                lab.set_halign(Gtk.Align.CENTER)
-                lab.get_style_context().add_class(cls)
-                col.pack_start(lab, False, False, 0)
-            b.add(col)
-            if is_cur:
-                ctx.add_class("active")
-                focus = b
-            if prof not in avail:
-                b.set_sensitive(False)
-            b.connect("clicked", lambda w, p=prof: self.apply(p))
-            row.pack_start(b, False, False, 0)
-            self.buttons.append((b, prof))
-            if prof in avail:
-                self.keys[key] = prof
-        card.pack_start(row, False, False, 0)
-        if cur is None:
-            self.sub.set_text("служба power-profiles-daemon не отвечает")
-            self.sub.get_style_context().add_class("err")
-        else:
-            self.sub.set_text("выбери режим работы процессора")
-            self.sub.get_style_context().add_class("sub")
-        hint = Gtk.Label(label="← →  выбор    Enter  применить    1 2 3  быстро    Esc  закрыть")
-        hint.get_style_context().add_class("hint")
-        card.pack_start(hint, False, False, 0)
-        hold.add(card)
-        bg.add(hold)
-        self.add(bg)
-        self.connect("key-press-event", self.on_key)
-        self.first = focus
-        if self.first is None:
-            for b, prof in self.buttons:
-                if prof in avail:
-                    self.first = b
-                    break
-        self.fullscreen()
-
-    def live(self):
-        return [b for b, _ in self.buttons if b.get_sensitive()]
-
-    def focus_step(self, d):
-        lst = self.live()
-        if not lst:
-            return
-        cur = self.get_focus()
-        i = lst.index(cur) if cur in lst else -1
-        lst[(i + d) % len(lst)].grab_focus()
-
-    def on_key(self, w, ev):
-        k = Gdk.keyval_name(ev.keyval) or ""
-        if k == "Escape":
-            self.quit()
-        elif k in ("Left", "Up", "ISO_Left_Tab"):
-            self.focus_step(-1)
-        elif k in ("Right", "Down", "Tab"):
-            self.focus_step(1)
-        elif k in self.keys:
-            self.apply(self.keys[k])
-        else:
-            return False
-        return True
-
-    def apply(self, prof):
-        try:
-            r = ppd("set", prof)
-            ok = r.returncode == 0
-        except Exception:
-            ok = False
-        if not ok:
-            ctx = self.sub.get_style_context()
-            ctx.remove_class("sub")
-            ctx.add_class("err")
-            self.sub.set_text("не удалось переключить профиль")
-            return
-        # обновить значок в waybar сразу
-        subprocess.Popen(["pkill", "-RTMIN+8", "waybar"], start_new_session=True)
-        self.quit()
-
-    def quit(self):
-        self.destroy()
-
-
-def on_destroy(*_):
-    drop_lock()
-    Gtk.main_quit()
-
-
-def main():
-    GLib.set_prgname("performance-menu")
-    GLib.set_application_name("performance-menu")
-    pid = running()
-    if pid:
-        try:
-            os.kill(pid, 15)
-        except OSError:
-            pass
-        drop_lock()
-        return
-    w = PerfMenu()
-    w.connect("destroy", on_destroy)
-    w.show_all()
-    try:
-        with open(LOCK, "w") as f:
-            f.write(str(os.getpid()))
-    except OSError:
-        pass
-    if w.first is not None:
-        w.first.grab_focus()
-    Gtk.main()
-
-
-if __name__ == "__main__":
-    main()
-EOF
-chmod 755 /usr/local/bin/performance-menu
-
-# ---------- меню звука, сети, календарь на год ----------
-cat > /usr/local/bin/audio-menu <<'EOF'
-#!/usr/bin/python3
+# ---------- общий модуль для всплывающих меню (звук, сеть, профили, календарь) ----------
+mkdir -p /usr/local/lib/hypr-menus
+cat > /usr/local/lib/hypr-menus/hyprmenu.py <<'EOF'
+# Общий код всплывающих меню: тема, иконки-глифы, окно-слой, одиночный запуск
 import json
 import os
 import re
@@ -2018,12 +1754,22 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 from gi.repository import Gdk, GLib, Gtk, Pango
 
-NAME = "audio-menu"
-LOCK = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), NAME + ".pid")
+try:
+    gi.require_version("GtkLayerShell", "0.1")
+    from gi.repository import GtkLayerShell
+except (ValueError, ImportError):
+    GtkLayerShell = None
+
+BAR_GAP = 38  # отступ сверху: высота waybar + небольшой зазор
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+NAME = "hyprmenu"
+LOCK = os.path.join(RUNTIME, NAME + ".pid")
 FA_FONT = "FontAwesome"
 BASE_CSS = b"""
 * { font-family: "DejaVu Sans Mono", "FontAwesome", monospace; }
 window { background-color: rgba(4,7,5,0.60); }
+window.popup { background-color: rgba(0,0,0,0); }
+.pcard { padding: 14px 16px 12px 16px; border-radius: 16px; }
 .card { background-color: rgba(15,20,16,0.90); border: 1px solid rgba(169,204,130,0.45);
 border-radius: 20px; padding: 20px 24px 14px 24px; }
 .title { color: #e4ebe2; font-size: 14px; }
@@ -2053,6 +1799,13 @@ scrolledwindow, viewport { background-color: transparent; }
 scrollbar slider { background-color: rgba(169,204,130,0.35); border-radius: 4px; min-width: 6px; min-height: 6px; margin: 0; }
 scrollbar { background: transparent; border: none; }
 """
+
+
+def init(name):
+    """Имя меню: от него зависят класс окна, файл блокировки и namespace слоя."""
+    global NAME, LOCK
+    NAME = name
+    LOCK = os.path.join(RUNTIME, name + ".pid")
 
 
 def running():
@@ -2135,30 +1888,104 @@ def fire(args):
     threading.Thread(target=sh, args=(args,), daemon=True).start()
 
 
+def use_layer(win):
+    """Делает окно слоем поверх всего (layer-shell). False - если не получилось."""
+    if GtkLayerShell is None:
+        return False
+    try:
+        if not GtkLayerShell.is_supported():
+            return False
+        GtkLayerShell.init_for_window(win)
+        GtkLayerShell.set_namespace(win, NAME)
+        GtkLayerShell.set_layer(win, GtkLayerShell.Layer.OVERLAY)
+        for edge in (GtkLayerShell.Edge.TOP, GtkLayerShell.Edge.BOTTOM,
+                     GtkLayerShell.Edge.LEFT, GtkLayerShell.Edge.RIGHT):
+            GtkLayerShell.set_anchor(win, edge, True)
+        GtkLayerShell.set_exclusive_zone(win, -1)
+        if hasattr(GtkLayerShell, "KeyboardMode"):
+            GtkLayerShell.set_keyboard_mode(win, GtkLayerShell.KeyboardMode.EXCLUSIVE)
+        else:
+            GtkLayerShell.set_keyboard_interactivity(win, True)
+        return True
+    except Exception:
+        return False
+
+
+def pointer_x():
+    """X курсора внутри его монитора и ширина монитора (логические пиксели)."""
+    try:
+        r = sh(["hyprctl", "cursorpos", "-j"], 2)
+        try:
+            cx = float(json.loads(r.stdout)["x"])
+        except ValueError:
+            cx = float(re.findall(r"-?\d+", r.stdout)[0])
+        mons = json.loads(sh(["hyprctl", "monitors", "-j"], 2).stdout)
+        for m in mons:
+            sc = float(m.get("scale", 1)) or 1.0
+            w = m["width"] / sc
+            if m["x"] <= cx < m["x"] + w:
+                return cx - m["x"], w
+    except Exception:
+        pass
+    return None, None
+
+
+def screen_width():
+    try:
+        disp = Gdk.Display.get_default()
+        mon = disp.get_primary_monitor() or disp.get_monitor(0)
+        return mon.get_geometry().width
+    except Exception:
+        return 1920
+
+
 class Overlay(Gtk.Window):
-    def __init__(self, extra_css=b""):
+    def __init__(self, extra_css=b"", popup=True):
         super().__init__(title=NAME)
         self.set_decorated(False)
+        self.is_popup = popup
+        self.layer = popup and use_layer(self)
         screen = self.get_screen()
         visual = screen.get_rgba_visual()
         if visual:
             self.set_visual(visual)
         apply_css(screen, BASE_CSS + extra_css)
+        if self.layer:
+            self.get_style_context().add_class("popup")
         bg = Gtk.EventBox()
         bg.set_visible_window(False)
         bg.connect("button-press-event", lambda w, e: self.quit())
-        hold = Gtk.EventBox()
-        hold.set_visible_window(False)
-        hold.set_halign(Gtk.Align.CENTER)
-        hold.set_valign(Gtk.Align.CENTER)
-        hold.connect("button-press-event", lambda w, e: True)
+        self.hold = Gtk.EventBox()
+        self.hold.set_visible_window(False)
+        self.hold.set_halign(Gtk.Align.CENTER)
+        self.hold.set_valign(Gtk.Align.CENTER)
+        self.hold.connect("button-press-event", lambda w, e: True)
         self.card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        self.card.get_style_context().add_class("card")
-        hold.add(self.card)
-        bg.add(hold)
+        ctx = self.card.get_style_context()
+        ctx.add_class("card")
+        if self.layer:
+            ctx.add_class("pcard")
+        self.hold.add(self.card)
+        bg.add(self.hold)
         self.add(bg)
         self.connect("key-press-event", self.on_key)
-        self.fullscreen()
+        if not self.layer:
+            self.fullscreen()
+
+    def place_card(self):
+        """Всплывающее окно: под иконкой, на которую нажали (по позиции курсора)."""
+        if not self.layer:
+            return
+        nat = self.card.get_preferred_width()[1]
+        cx, width = pointer_x()
+        if cx is None:
+            width = screen_width()
+            cx = width - nat / 2 - 12
+        x = max(8, min(cx - nat / 2, width - nat - 8))
+        self.hold.set_halign(Gtk.Align.START)
+        self.hold.set_valign(Gtk.Align.START)
+        self.hold.set_margin_start(int(x))
+        self.hold.set_margin_top(BAR_GAP)
 
     def on_key(self, w, ev):
         k = Gdk.keyval_name(ev.keyval) or ""
@@ -2192,6 +2019,7 @@ def run(cls):
         return
     w = cls()
     w.connect("destroy", on_destroy)
+    w.place_card()
     w.show_all()
     try:
         with open(LOCK, "w") as f:
@@ -2202,7 +2030,147 @@ def run(cls):
     if first is not None:
         first.grab_focus()
     Gtk.main()
+EOF
+chmod 644 /usr/local/lib/hypr-menus/hyprmenu.py
 
+# ---------- меню производительности (профили питания) ----------
+cat > /usr/local/bin/performance-menu <<'EOF'
+#!/usr/bin/python3
+import sys
+sys.path.insert(0, "/usr/local/lib/hypr-menus")
+import hyprmenu
+hyprmenu.init("performance-menu")
+from hyprmenu import *  # noqa: E402,F401,F403
+
+EXTRA_CSS = b"""
+button.tile { border-radius: 14px; padding: 0; }
+button.tile.active { background-color: rgba(125,148,96,0.32); border-color: #a9cc82; }
+button.tile:disabled { opacity: 0.35; }
+.tile-icon { color: #a9cc82; }
+button.perf .icon { color: #d8b76c; }
+.desc { color: #8a9a82; font-size: 9px; }
+.key { color: #75846d; font-size: 9px; }
+"""
+PROFILES = (
+    ("power-saver", "\uf06c", "Энергосбережение", "тише, дольше работа", "1", False),
+    ("balanced", "\uf24e", "Баланс", "на каждый день", "2", False),
+    ("performance", "\uf0e7", "Производительность", "максимум мощности", "3", True),
+)
+
+
+def ppd(*args):
+    return subprocess.run(["powerprofilesctl", *args], capture_output=True, text=True, timeout=5)
+
+
+def state():
+    # (текущий профиль, множество доступных профилей); при сбое (None, пусто)
+    try:
+        cur = ppd("get")
+        lst = ppd("list")
+        if cur.returncode != 0 or lst.returncode != 0:
+            return None, set()
+        names = set(re.findall(r"^\s*\*?\s*([a-z-]+):\s*$", lst.stdout, re.M))
+        return cur.stdout.strip(), names
+    except Exception:
+        return None, set()
+
+
+class PerfMenu(Overlay):
+    def __init__(self):
+        super().__init__(EXTRA_CSS)
+        self.first = None
+        self.keys = {}
+        self.buttons = []
+        cur, avail = state()
+        card = self.card
+        card.set_spacing(10)
+        card.pack_start(label("Профиль питания", "title", xalign=0), False, False, 0)
+        self.sub = label("выбери режим работы процессора" if cur else "служба power-profiles-daemon не отвечает",
+                         "sub" if cur else "err", xalign=0)
+        card.pack_start(self.sub, False, False, 0)
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        for prof, icon, name, desc, key, perf in PROFILES:
+            b = Gtk.Button()
+            b.set_size_request(148, 104)
+            ctx = b.get_style_context()
+            ctx.add_class("tile")
+            if perf:
+                ctx.add_class("perf")
+            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            col.set_valign(Gtk.Align.CENTER)
+            is_cur = prof == cur
+            col.pack_start(Glyph(icon, 24, 40, 34), False, False, 0)
+            col.pack_start(label(name, "name"), False, False, 0)
+            col.pack_start(label(desc, "desc"), False, False, 0)
+            col.pack_start(label(key + ("  ·  сейчас" if is_cur else ""), "key"), False, False, 0)
+            b.add(col)
+            if is_cur:
+                ctx.add_class("active")
+                self.first = b
+            if prof not in avail:
+                b.set_sensitive(False)
+            else:
+                self.keys[key] = prof
+            b.connect("clicked", lambda w, p=prof: self.choose(p))
+            row.pack_start(b, False, False, 0)
+            self.buttons.append((b, prof))
+        card.pack_start(row, False, False, 0)
+        if self.first is None:
+            for b, prof in self.buttons:
+                if prof in avail:
+                    self.first = b
+                    break
+
+    def live(self):
+        return [b for b, _ in self.buttons if b.get_sensitive()]
+
+    def step_focus(self, d):
+        lst = self.live()
+        if not lst:
+            return
+        cur = self.get_focus()
+        i = lst.index(cur) if cur in lst else -1
+        lst[(i + d) % len(lst)].grab_focus()
+
+    def key(self, name, ev):
+        if name in ("Left", "Up", "ISO_Left_Tab"):
+            self.step_focus(-1)
+        elif name in ("Right", "Down", "Tab"):
+            self.step_focus(1)
+        elif name in self.keys:
+            self.choose(self.keys[name])
+        else:
+            return False
+        return True
+
+    def choose(self, prof):
+        try:
+            ok = ppd("set", prof).returncode == 0
+        except Exception:
+            ok = False
+        if not ok:
+            ctx = self.sub.get_style_context()
+            ctx.remove_class("sub")
+            ctx.add_class("err")
+            self.sub.set_text("не удалось переключить профиль")
+            return
+        sh(["pkill", "-RTMIN+8", "waybar"], 2)  # обновить значок в панели сразу
+        self.quit()
+
+
+if __name__ == "__main__":
+    run(PerfMenu)
+EOF
+chmod 755 /usr/local/bin/performance-menu
+
+# ---------- меню звука ----------
+cat > /usr/local/bin/audio-menu <<'EOF'
+#!/usr/bin/python3
+import sys
+sys.path.insert(0, "/usr/local/lib/hypr-menus")
+import hyprmenu
+hyprmenu.init("audio-menu")
+from hyprmenu import *  # noqa: E402,F401,F403
 
 EXTRA_CSS = b"""
 .row-name { color: #e4ebe2; font-size: 11px; }
@@ -2258,13 +2226,13 @@ class VolRow(Gtk.Box):
         self.btn.set_size_request(42, 32)
         self.btn.set_valign(Gtk.Align.CENTER)
         self.btn.connect("clicked", self.on_click)
-        name = label(title, "row-name", xalign=0, chars=16)
-        name.set_max_width_chars(16)
+        name = label(title, "row-name", xalign=0, chars=11)
+        name.set_max_width_chars(11)
         name.set_ellipsize(Pango.EllipsizeMode.END)
         self.scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
         self.scale.set_draw_value(False)
         self.scale.set_hexpand(True)
-        self.scale.set_size_request(240, -1)
+        self.scale.set_size_request(150, -1)
         self.scale.set_value(min(vol, 100))
         self.pct = label(f"{vol}%", "pct", xalign=1, chars=4)
         self.scale.connect("value-changed", self.changed)
@@ -2307,7 +2275,7 @@ class AudioMenu(Overlay):
         self.first = None
         card = self.card
         card.set_spacing(10)
-        card.pack_start(label("Звук", "title"), False, False, 0)
+        card.pack_start(label("Звук", "title", xalign=0), False, False, 0)
 
         card.pack_start(label("ВЫВОД", "sect", xalign=0), False, False, 0)
         st = wp_state(SINK)
@@ -2351,230 +2319,39 @@ class AudioMenu(Overlay):
         else:
             card.pack_start(label("сейчас ни одно приложение не играет", "sub", xalign=0), False, False, 0)
 
-        card.pack_start(label("колесо мыши или ← → на ползунке    Esc  закрыть", "hint"), False, False, 6)
-
 
 if __name__ == "__main__":
     run(AudioMenu)
 EOF
 chmod 755 /usr/local/bin/audio-menu
 
+# ---------- меню сети ----------
 cat > /usr/local/bin/network-menu <<'EOF'
 #!/usr/bin/python3
-import json
-import os
-import re
-import subprocess
-import threading
-import time
-import gi
-gi.require_version("Gtk", "3.0")
-gi.require_version("Gdk", "3.0")
-from gi.repository import Gdk, GLib, Gtk, Pango
-
-NAME = "network-menu"
-LOCK = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), NAME + ".pid")
-FA_FONT = "FontAwesome"
-BASE_CSS = b"""
-* { font-family: "DejaVu Sans Mono", "FontAwesome", monospace; }
-window { background-color: rgba(4,7,5,0.60); }
-.card { background-color: rgba(15,20,16,0.90); border: 1px solid rgba(169,204,130,0.45);
-border-radius: 20px; padding: 20px 24px 14px 24px; }
-.title { color: #e4ebe2; font-size: 14px; }
-.sub { color: #8a9a82; font-size: 10px; }
-.sect { color: #8a9a82; font-size: 9px; }
-.name { color: #e4ebe2; font-size: 11px; }
-.pct { color: #a8b8a0; font-size: 10px; }
-.err { color: #d98b7d; font-size: 10px; }
-.ok { color: #a9cc82; font-size: 10px; }
-.hint { color: #75846d; font-size: 9px; }
-button { background-image: none; background-color: rgba(169,204,130,0.06); color: #e4ebe2;
-border: 1px solid rgba(169,204,130,0.25); border-radius: 12px; box-shadow: none;
-padding: 2px 10px; min-height: 0; min-width: 0; }
-button:hover, button:focus { background-color: rgba(169,204,130,0.18); border-color: #a9cc82; }
-button.off { color: #d98b7d; border-color: rgba(217,139,125,0.45); }
-entry { background-image: none; background-color: rgba(169,204,130,0.06); color: #e4ebe2;
-border: 1px solid rgba(169,204,130,0.25); border-radius: 12px; box-shadow: none; padding: 3px 10px; min-height: 0; }
-entry:focus { border-color: #a9cc82; }
-scale trough { background-color: rgba(169,204,130,0.18); background-image: none; border: none;
-border-radius: 4px; min-height: 6px; }
-scale highlight { background-color: #a9cc82; background-image: none; border: none; border-radius: 4px; }
-scale slider { background-color: #e4ebe2; background-image: none; border: none; box-shadow: none;
-border-radius: 50%; min-width: 16px; min-height: 16px; margin: -5px; }
-scale.muted highlight { background-color: #75846d; }
-scale.muted slider { background-color: #a8b8a0; }
-scrolledwindow, viewport { background-color: transparent; }
-scrollbar slider { background-color: rgba(169,204,130,0.35); border-radius: 4px; min-width: 6px; min-height: 6px; margin: 0; }
-scrollbar { background: transparent; border: none; }
-"""
-
-
-def running():
-    try:
-        with open(LOCK) as f:
-            pid = int(f.read().strip())
-        with open(f"/proc/{pid}/cmdline", "rb") as f:
-            return pid if NAME.encode() in f.read() else 0
-    except Exception:
-        return 0
-
-
-def drop_lock():
-    try:
-        os.remove(LOCK)
-    except OSError:
-        pass
-
-
-def apply_css(screen, css):
-    for rule in re.findall(rb"[^{}]+\{[^{}]*\}", css):
-        prov = Gtk.CssProvider()
-        try:
-            prov.load_from_data(rule)
-        except GLib.Error:
-            continue
-        Gtk.StyleContext.add_provider_for_screen(screen, prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
-
-
-def label(text, cls=None, xalign=0.5, chars=None):
-    lab = Gtk.Label(label=text, xalign=xalign)
-    if cls:
-        lab.get_style_context().add_class(cls)
-    if chars:
-        lab.set_width_chars(chars)
-    return lab
-
-
-class Glyph(Gtk.DrawingArea):
-    # иконка рисуется по центру реального контура глифа, а не по рамке строки,
-    # поэтому боковые отступы шрифта не сдвигают её вправо
-    def __init__(self, text, size, w=40, h=30, cls=None):
-        super().__init__()
-        self.text, self.size = text, size
-        self.set_size_request(w, h)
-        self.set_halign(Gtk.Align.CENTER)
-        self.set_valign(Gtk.Align.CENTER)
-        ctx = self.get_style_context()
-        ctx.add_class("icon")
-        if cls:
-            ctx.add_class(cls)
-        self.connect("draw", self.on_draw)
-
-    def set_text(self, text):
-        self.text = text
-        self.queue_draw()
-
-    def on_draw(self, widget, cr):
-        alloc = widget.get_allocation()
-        layout = widget.create_pango_layout(self.text)
-        fd = Pango.FontDescription()
-        fd.set_family(FA_FONT + ",Symbols Nerd Font Mono,Symbols Nerd Font")
-        fd.set_absolute_size(self.size * Pango.SCALE)
-        layout.set_font_description(fd)
-        ink, _logical = layout.get_pixel_extents()
-        x = round((alloc.width - ink.width) / 2 - ink.x)
-        y = round((alloc.height - ink.height) / 2 - ink.y)
-        Gtk.render_layout(widget.get_style_context(), cr, x, y, layout)
-        return False
-
-
-def sh(args, timeout=3, env=None):
-    try:
-        return subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=env)
-    except Exception:
-        return None
-
-
-def fire(args):
-    threading.Thread(target=sh, args=(args,), daemon=True).start()
-
-
-class Overlay(Gtk.Window):
-    def __init__(self, extra_css=b""):
-        super().__init__(title=NAME)
-        self.set_decorated(False)
-        screen = self.get_screen()
-        visual = screen.get_rgba_visual()
-        if visual:
-            self.set_visual(visual)
-        apply_css(screen, BASE_CSS + extra_css)
-        bg = Gtk.EventBox()
-        bg.set_visible_window(False)
-        bg.connect("button-press-event", lambda w, e: self.quit())
-        hold = Gtk.EventBox()
-        hold.set_visible_window(False)
-        hold.set_halign(Gtk.Align.CENTER)
-        hold.set_valign(Gtk.Align.CENTER)
-        hold.connect("button-press-event", lambda w, e: True)
-        self.card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        self.card.get_style_context().add_class("card")
-        hold.add(self.card)
-        bg.add(hold)
-        self.add(bg)
-        self.connect("key-press-event", self.on_key)
-        self.fullscreen()
-
-    def on_key(self, w, ev):
-        k = Gdk.keyval_name(ev.keyval) or ""
-        if k == "Escape":
-            self.quit()
-            return True
-        return self.key(k, ev)
-
-    def key(self, name, ev):
-        return False
-
-    def quit(self):
-        self.destroy()
-
-
-def on_destroy(*_):
-    drop_lock()
-    Gtk.main_quit()
-
-
-def run(cls):
-    GLib.set_prgname(NAME)
-    GLib.set_application_name(NAME)
-    pid = running()
-    if pid:
-        try:
-            os.kill(pid, 15)
-        except OSError:
-            pass
-        drop_lock()
-        return
-    w = cls()
-    w.connect("destroy", on_destroy)
-    w.show_all()
-    try:
-        with open(LOCK, "w") as f:
-            f.write(str(os.getpid()))
-    except OSError:
-        pass
-    first = getattr(w, "first", None)
-    if first is not None:
-        first.grab_focus()
-    Gtk.main()
-
+import sys
+sys.path.insert(0, "/usr/local/lib/hypr-menus")
+import hyprmenu
+hyprmenu.init("network-menu")
+from hyprmenu import *  # noqa: E402,F401,F403
 
 EXTRA_CSS = b"""
 .wifi-list { background-color: transparent; }
-.wifi-list row { padding: 7px 10px; margin: 2px 0; border-radius: 10px; background-color: transparent; }
+.wifi-list row { padding: 6px 8px; margin: 1px 0; border-radius: 9px; background-color: transparent; }
 .wifi-list row:hover { background-color: rgba(169,204,130,0.12); }
-.wifi-list row:focus, .wifi-list row:selected { background-color: rgba(169,204,130,0.20); }
-.wifi-list row.active { background-color: rgba(125,148,96,0.28); }
+.wifi-list row:focus { background-color: rgba(169,204,130,0.18); }
+.wifi-list row.active { background-color: rgba(125,148,96,0.26); }
 .icon.weak { color: #75846d; }
 .icon.mid { color: #a8b8a0; }
 .icon.good { color: #a9cc82; }
 .icon.lock { color: #8a9a82; }
 .icon.mark { color: #a9cc82; }
-.status-card { background-color: rgba(169,204,130,0.06); border: 1px solid rgba(169,204,130,0.22);
-border-radius: 14px; padding: 10px 14px; }
+.status-card { background-color: rgba(169,204,130,0.06); border: 1px solid rgba(169,204,130,0.20);
+border-radius: 12px; padding: 8px 12px; }
 .big { color: #e4ebe2; font-size: 12px; }
+button.tool { padding: 2px 6px; border-radius: 9px; }
 """
 ENV = dict(os.environ, LC_ALL="C", LANG="C")
-WIFI, LOCK_I, CHECK, PLUG = "\uf1eb", "\uf023", "\uf00c", "\uf1e6"
+WIFI, LOCK_I, CHECK, PLUG, REFRESH = "\uf1eb", "\uf023", "\uf00c", "\uf1e6", "\uf021"
 
 
 def nm_run(args, timeout=15):
@@ -2615,7 +2392,7 @@ def friendly(err):
         return "Сеть не найдена, обнови список"
     if "secrets were required" in low or "password" in low or "802-1x" in low:
         return "Неверный пароль или нужна авторизация"
-    if "timeout" in low or "time" in low and "expired" in low:
+    if "timeout" in low or ("time" in low and "expired" in low):
         return "Не удалось подключиться за отведённое время"
     return text
 
@@ -2686,22 +2463,31 @@ class NetMenu(Overlay):
         self.note = None
         card = self.card
         card.set_spacing(10)
-        card.set_size_request(500, -1)
-        card.pack_start(label("Сеть", "title"), False, False, 0)
+        card.set_size_request(340, -1)
+
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        head.pack_start(label("Сеть", "title", xalign=0), True, True, 0)
+        head.pack_start(label("Wi-Fi", "sub"), False, False, 0)
+        self.switch = Gtk.Switch()
+        self.switch.set_valign(Gtk.Align.CENTER)
+        self.switch.connect("notify::active", self.on_switch)
+        head.pack_start(self.switch, False, False, 0)
+        card.pack_start(head, False, False, 0)
 
         self.status_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         self.status_box.get_style_context().add_class("status-card")
         card.pack_start(self.status_box, False, False, 0)
 
-        sw_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        sw_row.pack_start(label("Wi-Fi", "name", xalign=0), True, True, 0)
-        self.switch = Gtk.Switch()
-        self.switch.set_valign(Gtk.Align.CENTER)
-        self.switch.connect("notify::active", self.on_switch)
-        sw_row.pack_start(self.switch, False, False, 0)
-        card.pack_start(sw_row, False, False, 0)
+        sec = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        sec.pack_start(label("ДОСТУПНЫЕ СЕТИ", "sect", xalign=0), True, True, 0)
+        self.b_refresh = Gtk.Button()
+        self.b_refresh.get_style_context().add_class("tool")
+        self.b_refresh.add(Glyph(REFRESH, 12, 18, 16))
+        self.b_refresh.set_tooltip_text("Обновить список")
+        self.b_refresh.connect("clicked", lambda *_: self.refresh(True))
+        sec.pack_start(self.b_refresh, False, False, 0)
+        card.pack_start(sec, False, False, 0)
 
-        card.pack_start(label("ДОСТУПНЫЕ СЕТИ", "sect", xalign=0), False, False, 0)
         self.list = Gtk.ListBox()
         self.list.set_selection_mode(Gtk.SelectionMode.NONE)
         self.list.set_activate_on_single_click(True)
@@ -2709,8 +2495,8 @@ class NetMenu(Overlay):
         self.list.connect("row-activated", self.on_row)
         sc = Gtk.ScrolledWindow()
         sc.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-        sc.set_min_content_height(120)
-        sc.set_max_content_height(280)
+        sc.set_min_content_height(80)
+        sc.set_max_content_height(210)
         sc.set_propagate_natural_height(True)
         sc.add(self.list)
         card.pack_start(sc, False, False, 0)
@@ -2718,6 +2504,8 @@ class NetMenu(Overlay):
         # ввод пароля (появляется при выборе защищённой сети)
         self.pw_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         self.pw_title = label("", "name", xalign=0)
+        self.pw_title.set_ellipsize(Pango.EllipsizeMode.END)
+        self.pw_title.set_max_width_chars(34)
         self.pw_entry = Gtk.Entry()
         self.pw_entry.set_visibility(False)
         self.pw_entry.set_placeholder_text("Пароль")
@@ -2739,19 +2527,13 @@ class NetMenu(Overlay):
 
         self.msg = label("", "sub", xalign=0)
         self.msg.set_line_wrap(True)
-        self.msg.set_max_width_chars(60)
+        self.msg.set_max_width_chars(44)
         card.pack_start(self.msg, False, False, 0)
 
-        btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self.b_refresh = Gtk.Button(label="Обновить")
-        self.b_refresh.connect("clicked", lambda *_: self.refresh(True))
         self.b_disc = Gtk.Button(label="Отключиться от Wi-Fi")
         self.b_disc.connect("clicked", lambda *_: self.leave())
-        btns.pack_start(self.b_refresh, False, False, 0)
-        btns.pack_start(self.b_disc, False, False, 0)
-        card.pack_start(btns, False, False, 0)
-        card.pack_start(label("клик по сети - подключиться    Esc  закрыть", "hint"), False, False, 4)
-        self.first = self.b_refresh
+        card.pack_start(self.b_disc, False, False, 0)
+        self.first = self.list
         GLib.idle_add(self.pw_box.hide)
         GLib.idle_add(self.refresh, False)
 
@@ -2789,22 +2571,24 @@ class NetMenu(Overlay):
             self.status_box.pack_start(label("Нет связи с NetworkManager", "big", xalign=0), False, False, 0)
             self.status_box.pack_start(label(info["err"], "err", xalign=0), False, False, 0)
         elif not info["active"]:
-            self.status_box.pack_start(label("Нет подключения", "big", xalign=0), False, False, 0)
-            self.status_box.pack_start(label("выбери сеть ниже", "sub", xalign=0), False, False, 0)
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            row.pack_start(Glyph(WIFI, 16, 26, 26, "weak"), False, False, 0)
+            row.pack_start(label("Нет подключения", "big", xalign=0), True, True, 0)
+            self.status_box.pack_start(row, False, False, 0)
         for a in info["active"]:
-            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
-            row.pack_start(Glyph(WIFI if a["type"] == "wifi" else PLUG, 18, 30, 30, "good"), False, False, 0)
-            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-            kind = "Wi-Fi" if a["type"] == "wifi" else "Проводное соединение"
-            col.pack_start(label(f"{kind} · {a['name']}", "big", xalign=0), False, False, 0)
-            bits = []
-            if a["ip"]:
-                bits.append("IP " + a["ip"])
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            row.pack_start(Glyph(WIFI if a["type"] == "wifi" else PLUG, 16, 26, 26, "good"), False, False, 0)
+            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
+            name = label(a["name"], "big", xalign=0)
+            name.set_ellipsize(Pango.EllipsizeMode.END)
+            name.set_max_width_chars(28)
+            col.pack_start(name, False, False, 0)
+            bits = ["Wi-Fi" if a["type"] == "wifi" else "Кабель · " + a["dev"]]
             if a["signal"] is not None:
-                bits.append(f"сигнал {a['signal']}%")
-            if a["type"] == "ethernet":
-                bits.append(a["dev"])
-            col.pack_start(label("  ·  ".join(bits) or "подключено", "sub", xalign=0), False, False, 0)
+                bits.append(f"{a['signal']}%")
+            if a["ip"]:
+                bits.append(a["ip"])
+            col.pack_start(label("  ·  ".join(bits), "sub", xalign=0), False, False, 0)
             row.pack_start(col, True, True, 0)
             self.status_box.pack_start(row, False, False, 0)
         self.status_box.show_all()
@@ -2819,7 +2603,9 @@ class NetMenu(Overlay):
         for w in info["wifi"]:
             self.list.add(self.make_row(w))
         self.list.show_all()
-        self.b_disc.set_sensitive(any(a["type"] == "wifi" for a in info["active"]))
+        has_wifi = any(a["type"] == "wifi" for a in info["active"])
+        self.b_disc.set_visible(has_wifi)
+        self.b_disc.set_no_show_all(not has_wifi)
         if self.note:
             self.say(*self.note)
             self.note = None
@@ -2828,28 +2614,28 @@ class NetMenu(Overlay):
         elif not info["radio"]:
             self.say("Wi-Fi выключен")
         elif not info["wifi"]:
-            self.say("Сети не найдены (нет Wi-Fi адаптера или нужно обновить)")
+            self.say("Сети не найдены, попробуй обновить")
         else:
-            self.say(f"Найдено сетей: {len(info['wifi'])}")
+            self.say("")
         return False
 
     def make_row(self, w):
         row = Gtk.ListBoxRow()
         row.ssid, row.secured, row.is_active = w["ssid"], w["secured"], w["active"]
+        row.set_tooltip_text(f"{w['ssid']} · {w['signal']}%")
         box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
         s = w["signal"]
         cls = "good" if s >= 60 else ("mid" if s >= 35 else "weak")
-        box.pack_start(Glyph(WIFI, 14, 24, 20, cls), False, False, 0)
+        box.pack_start(Glyph(WIFI, 14, 22, 18, cls), False, False, 0)
         name = label(w["ssid"], "name", xalign=0)
         name.set_ellipsize(Pango.EllipsizeMode.END)
-        name.set_max_width_chars(30)
+        name.set_max_width_chars(26)
         box.pack_start(name, True, True, 0)
         if w["secured"]:
-            box.pack_start(Glyph(LOCK_I, 11, 18, 18, "lock"), False, False, 0)
+            box.pack_start(Glyph(LOCK_I, 11, 16, 16, "lock"), False, False, 0)
         if w["active"]:
-            box.pack_start(Glyph(CHECK, 12, 18, 18, "mark"), False, False, 0)
+            box.pack_start(Glyph(CHECK, 12, 16, 16, "mark"), False, False, 0)
             row.get_style_context().add_class("active")
-        box.pack_start(label(f"{s}%", "pct", xalign=1, chars=4), False, False, 0)
         row.add(box)
         return row
 
@@ -2961,205 +2747,14 @@ if __name__ == "__main__":
 EOF
 chmod 755 /usr/local/bin/network-menu
 
+# ---------- календарь на год ----------
 cat > /usr/local/bin/year-calendar <<'EOF'
 #!/usr/bin/python3
-import json
-import os
-import re
-import subprocess
-import threading
-import time
-import gi
-gi.require_version("Gtk", "3.0")
-gi.require_version("Gdk", "3.0")
-from gi.repository import Gdk, GLib, Gtk, Pango
-
-NAME = "year-calendar"
-LOCK = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), NAME + ".pid")
-FA_FONT = "FontAwesome"
-BASE_CSS = b"""
-* { font-family: "DejaVu Sans Mono", "FontAwesome", monospace; }
-window { background-color: rgba(4,7,5,0.60); }
-.card { background-color: rgba(15,20,16,0.90); border: 1px solid rgba(169,204,130,0.45);
-border-radius: 20px; padding: 20px 24px 14px 24px; }
-.title { color: #e4ebe2; font-size: 14px; }
-.sub { color: #8a9a82; font-size: 10px; }
-.sect { color: #8a9a82; font-size: 9px; }
-.name { color: #e4ebe2; font-size: 11px; }
-.pct { color: #a8b8a0; font-size: 10px; }
-.err { color: #d98b7d; font-size: 10px; }
-.ok { color: #a9cc82; font-size: 10px; }
-.hint { color: #75846d; font-size: 9px; }
-button { background-image: none; background-color: rgba(169,204,130,0.06); color: #e4ebe2;
-border: 1px solid rgba(169,204,130,0.25); border-radius: 12px; box-shadow: none;
-padding: 2px 10px; min-height: 0; min-width: 0; }
-button:hover, button:focus { background-color: rgba(169,204,130,0.18); border-color: #a9cc82; }
-button.off { color: #d98b7d; border-color: rgba(217,139,125,0.45); }
-entry { background-image: none; background-color: rgba(169,204,130,0.06); color: #e4ebe2;
-border: 1px solid rgba(169,204,130,0.25); border-radius: 12px; box-shadow: none; padding: 3px 10px; min-height: 0; }
-entry:focus { border-color: #a9cc82; }
-scale trough { background-color: rgba(169,204,130,0.18); background-image: none; border: none;
-border-radius: 4px; min-height: 6px; }
-scale highlight { background-color: #a9cc82; background-image: none; border: none; border-radius: 4px; }
-scale slider { background-color: #e4ebe2; background-image: none; border: none; box-shadow: none;
-border-radius: 50%; min-width: 16px; min-height: 16px; margin: -5px; }
-scale.muted highlight { background-color: #75846d; }
-scale.muted slider { background-color: #a8b8a0; }
-scrolledwindow, viewport { background-color: transparent; }
-scrollbar slider { background-color: rgba(169,204,130,0.35); border-radius: 4px; min-width: 6px; min-height: 6px; margin: 0; }
-scrollbar { background: transparent; border: none; }
-"""
-
-
-def running():
-    try:
-        with open(LOCK) as f:
-            pid = int(f.read().strip())
-        with open(f"/proc/{pid}/cmdline", "rb") as f:
-            return pid if NAME.encode() in f.read() else 0
-    except Exception:
-        return 0
-
-
-def drop_lock():
-    try:
-        os.remove(LOCK)
-    except OSError:
-        pass
-
-
-def apply_css(screen, css):
-    for rule in re.findall(rb"[^{}]+\{[^{}]*\}", css):
-        prov = Gtk.CssProvider()
-        try:
-            prov.load_from_data(rule)
-        except GLib.Error:
-            continue
-        Gtk.StyleContext.add_provider_for_screen(screen, prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
-
-
-def label(text, cls=None, xalign=0.5, chars=None):
-    lab = Gtk.Label(label=text, xalign=xalign)
-    if cls:
-        lab.get_style_context().add_class(cls)
-    if chars:
-        lab.set_width_chars(chars)
-    return lab
-
-
-class Glyph(Gtk.DrawingArea):
-    # иконка рисуется по центру реального контура глифа, а не по рамке строки,
-    # поэтому боковые отступы шрифта не сдвигают её вправо
-    def __init__(self, text, size, w=40, h=30, cls=None):
-        super().__init__()
-        self.text, self.size = text, size
-        self.set_size_request(w, h)
-        self.set_halign(Gtk.Align.CENTER)
-        self.set_valign(Gtk.Align.CENTER)
-        ctx = self.get_style_context()
-        ctx.add_class("icon")
-        if cls:
-            ctx.add_class(cls)
-        self.connect("draw", self.on_draw)
-
-    def set_text(self, text):
-        self.text = text
-        self.queue_draw()
-
-    def on_draw(self, widget, cr):
-        alloc = widget.get_allocation()
-        layout = widget.create_pango_layout(self.text)
-        fd = Pango.FontDescription()
-        fd.set_family(FA_FONT + ",Symbols Nerd Font Mono,Symbols Nerd Font")
-        fd.set_absolute_size(self.size * Pango.SCALE)
-        layout.set_font_description(fd)
-        ink, _logical = layout.get_pixel_extents()
-        x = round((alloc.width - ink.width) / 2 - ink.x)
-        y = round((alloc.height - ink.height) / 2 - ink.y)
-        Gtk.render_layout(widget.get_style_context(), cr, x, y, layout)
-        return False
-
-
-def sh(args, timeout=3, env=None):
-    try:
-        return subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=env)
-    except Exception:
-        return None
-
-
-def fire(args):
-    threading.Thread(target=sh, args=(args,), daemon=True).start()
-
-
-class Overlay(Gtk.Window):
-    def __init__(self, extra_css=b""):
-        super().__init__(title=NAME)
-        self.set_decorated(False)
-        screen = self.get_screen()
-        visual = screen.get_rgba_visual()
-        if visual:
-            self.set_visual(visual)
-        apply_css(screen, BASE_CSS + extra_css)
-        bg = Gtk.EventBox()
-        bg.set_visible_window(False)
-        bg.connect("button-press-event", lambda w, e: self.quit())
-        hold = Gtk.EventBox()
-        hold.set_visible_window(False)
-        hold.set_halign(Gtk.Align.CENTER)
-        hold.set_valign(Gtk.Align.CENTER)
-        hold.connect("button-press-event", lambda w, e: True)
-        self.card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        self.card.get_style_context().add_class("card")
-        hold.add(self.card)
-        bg.add(hold)
-        self.add(bg)
-        self.connect("key-press-event", self.on_key)
-        self.fullscreen()
-
-    def on_key(self, w, ev):
-        k = Gdk.keyval_name(ev.keyval) or ""
-        if k == "Escape":
-            self.quit()
-            return True
-        return self.key(k, ev)
-
-    def key(self, name, ev):
-        return False
-
-    def quit(self):
-        self.destroy()
-
-
-def on_destroy(*_):
-    drop_lock()
-    Gtk.main_quit()
-
-
-def run(cls):
-    GLib.set_prgname(NAME)
-    GLib.set_application_name(NAME)
-    pid = running()
-    if pid:
-        try:
-            os.kill(pid, 15)
-        except OSError:
-            pass
-        drop_lock()
-        return
-    w = cls()
-    w.connect("destroy", on_destroy)
-    w.show_all()
-    try:
-        with open(LOCK, "w") as f:
-            f.write(str(os.getpid()))
-    except OSError:
-        pass
-    first = getattr(w, "first", None)
-    if first is not None:
-        first.grab_focus()
-    Gtk.main()
-
-
+import sys
+sys.path.insert(0, "/usr/local/lib/hypr-menus")
+import hyprmenu
+hyprmenu.init("year-calendar")
+from hyprmenu import *  # noqa: E402,F401,F403
 import calendar
 import datetime
 
@@ -3195,7 +2790,7 @@ def screen_height():
 
 class YearCal(Overlay):
     def __init__(self):
-        super().__init__(EXTRA_CSS)
+        super().__init__(EXTRA_CSS, popup=False)
         self.first = None
         self.today = datetime.date.today()
         self.year = self.today.year
@@ -3325,6 +2920,7 @@ chmod 755 /usr/local/bin/volume-click
 
 cat > /usr/local/bin/performance-status <<'EOF'
 #!/usr/bin/python3
+# значок профиля питания для waybar (обновляется сигналом RTMIN+8)
 import json
 import subprocess
 
@@ -3348,6 +2944,1971 @@ print(json.dumps(out, ensure_ascii=False))
 EOF
 chmod 755 /usr/local/bin/performance-status
 
+# ---------- приложение «Настройки» (Super+Shift+I), в лаунчер не добавляется ----------
+cat > /usr/local/bin/hypr-settings <<'SETTINGS_EOF'
+#!/usr/bin/python3
+# Настройки (Super+Shift+I): лёгкое приложение настроек для Hyprland
+import getpass
+import glob
+import json
+import math
+import os
+import random
+import re
+import shutil
+import socket
+import struct
+import subprocess
+import threading
+import time
+import wave
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Pango
+
+try:
+    import cairo
+    ROUND_CAP = cairo.LINE_CAP_ROUND
+except ImportError:
+    ROUND_CAP = 1
+
+NAME = "hypr-settings"
+HOME = os.path.realpath(os.path.expanduser("~"))
+RUN = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+LOCK = os.path.join(RUN, NAME + ".pid")
+BEEP = os.path.join(RUN, NAME + "-beep.wav")
+STATE = os.path.join(HOME, ".config", NAME, "state.json")
+LUA = os.path.join(HOME, ".config", "hypr", "settings.lua")
+WALL = os.path.join(HOME, "Pictures", "wall")
+WALL_CUR = os.path.join(HOME, ".cache", "wallpaper")
+WALL_MODE = os.path.join(HOME, ".config", "hypr", "wallpaper-mode")
+WALL_SH = os.path.join(HOME, ".config", "hypr", "wallpaper.sh")
+THUMBS = os.path.join(HOME, ".cache", NAME, "thumbs")
+TRASH = os.path.join(HOME, ".local", "share", "Trash")
+IMG_EXT = (".png", ".jpg", ".jpeg", ".webp")
+THW, THH = 200, 116
+V, H = Gtk.Orientation.VERTICAL, Gtk.Orientation.HORIZONTAL
+CENTER = Gtk.Align.CENTER
+C_ENV = dict(os.environ, LC_ALL="C", LANG="C")
+
+DEFAULTS = {
+    "gaps_in": 6, "gaps_out": 14, "border_size": 1, "rounding": 8,
+    "blur": True, "animations": True, "inactive_opacity": 0.95, "accent": "a9cc82",
+    "repeat_rate": 40, "repeat_delay": 250, "sensitivity": 0.0, "natural_scroll": True,
+    "kb_toggle": "grp:alt_shift_toggle", "night_temp": 4500, "scales": {}, "game": None,
+}
+KEYWORDS = {
+    "gaps_in": "general:gaps_in", "gaps_out": "general:gaps_out",
+    "border_size": "general:border_size", "accent": "general:col.active_border",
+    "rounding": "decoration:rounding", "inactive_opacity": "decoration:inactive_opacity",
+    "blur": "decoration:blur:enabled", "animations": "animations:enabled",
+    "repeat_rate": "input:repeat_rate", "repeat_delay": "input:repeat_delay",
+    "sensitivity": "input:sensitivity", "natural_scroll": "input:touchpad:natural_scroll",
+    "kb_toggle": "input:kb_options",
+}
+ACCENTS = (("a9cc82", "Олива"), ("8fbf9f", "Шалфей"), ("9fd8c4", "Мята"), ("8fb8d8", "Небо"),
+           ("b4a7d6", "Лаванда"), ("d98b9b", "Роза"), ("e0a88c", "Персик"), ("d8b76c", "Песок"),
+           ("e4ebe2", "Туман"))
+BG_COLORS = ("0f1410", "1b2418", "2c3d22", "20262e", "2a2230", "2e2a22", "101010")
+PRESETS = (
+    ("Компактно", dict(gaps_in=2, gaps_out=4, rounding=4, border_size=1)),
+    ("Стандарт", dict(gaps_in=6, gaps_out=14, rounding=8, border_size=1, blur=True,
+                      animations=True, inactive_opacity=0.95)),
+    ("Воздушно", dict(gaps_in=10, gaps_out=26, rounding=14, border_size=2)),
+    ("Минимум нагрузки", dict(blur=False, animations=False, inactive_opacity=1.0, gaps_in=4, gaps_out=8)),
+)
+GAME = dict(gaps_in=0, gaps_out=0, rounding=0, border_size=1, blur=False, animations=False, inactive_opacity=1.0)
+PROFILES = (
+    ("power-saver", "power-profile-power-saver-symbolic", "Экономия", "тише и дольше"),
+    ("balanced", "power-profile-balanced-symbolic", "Баланс", "на каждый день"),
+    ("performance", "power-profile-performance-symbolic", "Мощность", "максимум скорости"),
+)
+KB_TOGGLES = (("grp:alt_shift_toggle", "Alt + Shift"), ("grp:ctrl_shift_toggle", "Ctrl + Shift"),
+              ("grp:caps_toggle", "Caps Lock"), ("", "Только Super + Space"))
+STATUS_RU = {"Charging": "заряжается", "Discharging": "разряжается", "Full": "заряжена полностью",
+             "Not charging": "не заряжается", "Unknown": "неизвестно"}
+HOTKEYS = (
+    ("Super+Enter", "Терминал с fastfetch"), ("Super+D", "Лаунчер приложений"),
+    ("Super+E", "Файлы"), ("Super+B", "Firefox"), ("Super+Shift+I", "Настройки"),
+    ("Super+W", "Следующие обои"), ("Super+V", "Плавающее окно / тайлинг"),
+    ("Super+F", "Полный экран"), ("Super+Q", "Закрыть окно"),
+    ("Super+Shift+Q", "Держать и водить мышью - закрывать окна под курсором"),
+    ("Super+Shift+Esc", "Меню питания"), ("Super+Shift+S", "Скриншот области в буфер"),
+    ("Super+Space", "Сменить раскладку"), ("Super+← ↑ → ↓", "Фокус на соседнее окно"),
+    ("Super+Shift+← ↑ → ↓", "Переместить окно"), ("Super+Ctrl+← ↑ → ↓", "Изменить размер окна"),
+    ("Super+1…5", "Перейти на рабочий стол"), ("Super+Shift+1…5", "Отправить окно на рабочий стол"),
+    ("Super+Tab", "Следующий рабочий стол"), ("Super+Колесо", "Листать рабочие столы"),
+    ("Super+ЛКМ", "Двигать окно мышью"), ("Super+ПКМ", "Менять размер окна мышью"),
+    ("Ctrl+Tab", "Настройки: следующий раздел"), ("Esc", "Настройки: закрыть"),
+)
+TIPS = (
+    "Super+Shift+S копирует область экрана в буфер - вставляй сразу в Telegram.",
+    "Двойной клик по громкости в панели открывает микшер приложений.",
+    "Колесо мыши над яркостью или громкостью в панели меняет их без меню.",
+    "Клик по дате в панели открывает календарь на весь год.",
+    "Положи PNG в ~/.config/fastfetch/logo.png - он появится в терминале.",
+    "В Files: Ctrl+H - скрытые файлы, Ctrl+D - закладка, F4 - терминал здесь.",
+    "Игровой режим во вкладке «Разное» убирает всё лишнее одним переключателем.",
+    "Команда cava в терминале - красивый визуализатор музыки.",
+    "Раз в неделю полезно обновлять систему: «Хранилище» → «Обновить».",
+    "Профиль «Экономия» заметно продлевает работу ноутбука от батареи.",
+    "Окно Настроек можно таскать за заголовок или Super+ЛКМ.",
+    "Super+V делает окно плавающим - удобно для калькулятора и плееров.",
+)
+PAGES = (
+    ("overview", "Обзор", "computer-symbolic"),
+    ("appearance", "Оформление", "preferences-desktop-appearance-symbolic"),
+    ("wallpaper", "Обои", "preferences-desktop-wallpaper-symbolic"),
+    ("display", "Экран", "video-display-symbolic"),
+    ("sound", "Звук", "audio-speakers-symbolic"),
+    ("input", "Клавиатура и мышь", "input-keyboard-symbolic"),
+    ("power", "Питание", "battery-good-symbolic"),
+    ("network", "Сеть", "network-wireless-symbolic"),
+    ("storage", "Хранилище", "drive-harddisk-symbolic"),
+    ("keys", "Горячие клавиши", "preferences-desktop-keyboard-shortcuts-symbolic"),
+    ("fun", "Разное", "face-smile-big-symbolic"),
+)
+
+CSS = b"""
+* { font-family: "DejaVu Sans", sans-serif; font-size: 11px; }
+window { background-color: rgba(15,20,16,0.90); color: #e4ebe2; }
+window.dialog, window.messagedialog, filechooser { background-color: rgb(20,27,22); }
+list { background-color: transparent; }
+.head { padding: 10px 12px 9px 18px; border-bottom: 1px solid rgba(169,204,130,0.14); }
+.logo { color: #a9cc82; font-size: 15px; }
+.apptitle { color: #c4dfa0; font-size: 13px; font-weight: bold; }
+.crumb { color: #8a9a82; }
+button.close { border-radius: 12px; padding: 2px 6px; }
+button.close:hover { background-color: rgba(217,139,125,0.25); border-color: #d98b7d; }
+.side { background-color: rgba(169,204,130,0.04); border-right: 1px solid rgba(169,204,130,0.12); }
+.side row { padding: 8px 12px; margin: 2px 8px; border-radius: 10px; background-color: transparent; }
+.side row:hover { background-color: rgba(169,204,130,0.10); }
+.side row:selected { background-color: rgba(169,204,130,0.24); color: #ffffff; }
+.sidefoot { color: #75846d; font-size: 9px; padding: 8px 18px 10px 18px; }
+.page { padding: 18px 28px 28px 28px; }
+.ptitle { color: #e4ebe2; font-size: 21px; font-weight: bold; }
+.psub { color: #8a9a82; }
+.gtitle { color: #8a9a82; font-size: 9px; font-weight: bold; margin: 16px 4px 5px 4px; }
+.group { background-color: rgba(169,204,130,0.05); border: 1px solid rgba(169,204,130,0.16);
+border-radius: 14px; padding: 2px 16px; }
+.srow { padding: 10px 0; }
+.krow { padding: 7px 0; border-bottom: 1px solid rgba(169,204,130,0.08); }
+.rtitle { color: #e4ebe2; }
+.rdesc { color: #8a9a82; font-size: 9px; }
+.val { color: #a8b8a0; font-family: "DejaVu Sans Mono", monospace; }
+.status { color: #8a9a82; padding: 4px 18px 6px 18px; border-top: 1px solid rgba(169,204,130,0.10); }
+.err { color: #d98b7d; }
+.ring { color: #e4ebe2; }
+.dice { font-size: 46px; color: #c4dfa0; }
+.chance { color: #c4dfa0; font-size: 13px; font-weight: bold; }
+.tip { color: #c4dfa0; font-size: 12px; font-style: italic; }
+.kbd { background-color: rgba(169,204,130,0.10); border: 1px solid rgba(169,204,130,0.30);
+border-bottom-width: 2px; border-radius: 6px; padding: 1px 7px; color: #c4dfa0;
+font-family: "DejaVu Sans Mono", monospace; font-size: 10px; }
+separator { background-color: rgba(169,204,130,0.09); min-height: 1px; min-width: 1px; }
+button { background-image: none; background-color: rgba(169,204,130,0.06); color: #e4ebe2;
+border: 1px solid rgba(169,204,130,0.25); border-radius: 12px; box-shadow: none;
+padding: 4px 12px; min-height: 0; min-width: 0; }
+button:hover { background-color: rgba(169,204,130,0.18); border-color: #a9cc82; }
+button:active { background-color: rgba(169,204,130,0.28); }
+button.accent { background-color: rgba(169,204,130,0.22); border-color: #a9cc82; }
+button.danger { color: #d98b7d; border-color: rgba(217,139,125,0.45); }
+button.danger:hover { background-color: rgba(217,139,125,0.20); border-color: #d98b7d; }
+button.swatch { padding: 0; border-radius: 16px; border: 2px solid rgba(0,0,0,0); min-width: 28px; min-height: 28px; }
+button.swatch.on { border-color: #ffffff; }
+button.tile { padding: 12px 8px; border-radius: 14px; }
+button.tile.on { background-color: rgba(125,148,96,0.34); border-color: #a9cc82; }
+button.wall { padding: 3px; border-radius: 12px; border: 2px solid rgba(169,204,130,0.12); }
+button.wall.on { border-color: #a9cc82; background-color: rgba(169,204,130,0.20); }
+flowboxchild { padding: 0; background-color: transparent; }
+entry { background-image: none; background-color: rgba(169,204,130,0.06); color: #e4ebe2;
+border: 1px solid rgba(169,204,130,0.25); border-radius: 12px; box-shadow: none; padding: 4px 12px; min-height: 0; }
+entry:focus { border-color: #a9cc82; }
+switch { background-image: none; background-color: rgba(169,204,130,0.12);
+border: 1px solid rgba(169,204,130,0.28); border-radius: 14px; }
+switch:checked { background-color: #7d9460; border-color: #a9cc82; }
+switch slider { background-image: none; background-color: #e4ebe2; border: none; box-shadow: none;
+border-radius: 50%; min-width: 18px; min-height: 18px; }
+scale trough { background-color: rgba(169,204,130,0.18); background-image: none; border: none;
+border-radius: 4px; min-height: 6px; }
+scale highlight { background-color: #a9cc82; background-image: none; border: none; border-radius: 4px; }
+scale slider { background-color: #e4ebe2; background-image: none; border: none; box-shadow: none;
+border-radius: 50%; min-width: 16px; min-height: 16px; margin: -5px; }
+progressbar trough { background-color: rgba(169,204,130,0.14); background-image: none; border: none;
+border-radius: 4px; min-height: 7px; }
+progressbar progress { background-color: #a9cc82; background-image: none; border: none;
+border-radius: 4px; min-height: 7px; }
+progressbar.warn progress { background-color: #d8b76c; }
+progressbar.crit progress { background-color: #d98b7d; }
+scrolledwindow, viewport { background-color: transparent; }
+scrollbar { background: transparent; border: none; }
+scrollbar slider { background-color: rgba(169,204,130,0.35); border-radius: 4px; min-width: 6px; min-height: 6px; }
+menu, .menu { background-color: rgb(20,27,22); color: #e4ebe2; border: 1px solid rgba(169,204,130,0.30); border-radius: 8px; padding: 4px; }
+menuitem { padding: 4px 10px; border-radius: 6px; }
+menuitem:hover { background-color: rgba(169,204,130,0.18); }
+tooltip { background-color: rgb(20,27,22); border: 1px solid rgba(169,204,130,0.40); border-radius: 8px; }
+"""
+
+
+# ================= утилиты =================
+def apply_css(screen, css):
+    for rule in re.findall(rb"[^{}]+\{[^{}]*\}", css):
+        prov = Gtk.CssProvider()
+        try:
+            prov.load_from_data(rule)
+        except GLib.Error:
+            continue
+        Gtk.StyleContext.add_provider_for_screen(screen, prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+
+def tint(widget, color):
+    prov = Gtk.CssProvider()
+    prov.load_from_data(f"button {{ background-color: #{color}; }} button:hover {{ background-color: #{color}; }}".encode())
+    widget.get_style_context().add_provider(prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)
+
+
+def sh(args, timeout=4, env=None):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=env)
+    except Exception:
+        return None
+
+
+def out(args, timeout=4, env=None):
+    r = sh(args, timeout, env)
+    return r.stdout.strip() if r and r.returncode == 0 else ""
+
+
+def fire(args):
+    threading.Thread(target=sh, args=(args,), daemon=True).start()
+
+
+def spawn(args):
+    try:
+        subprocess.Popen(args, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except OSError:
+        return False
+
+
+def in_terminal(cmd, title="Терминал"):
+    spawn(["alacritty", "--title", title, "-e", "sh", "-c",
+           cmd + '; echo; printf "Готово. Нажми Enter, чтобы закрыть..."; read _'])
+
+
+def bg(work, done=None):
+    def run():
+        res = work()
+        if done is not None:
+            def fin():
+                done(res)
+                return False
+            GLib.idle_add(fin)
+    threading.Thread(target=run, daemon=True).start()
+
+
+def read(path, default=""):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def human(n):
+    units = ("Б", "КБ", "МБ", "ГБ", "ТБ")
+    n = float(n)
+    for i, u in enumerate(units):
+        if n < 1024 or i == len(units) - 1:
+            return f"{n:.0f} {u}" if i == 0 else f"{n:.1f} {u}"
+        n /= 1024
+
+
+def fmt_dur(sec):
+    sec = int(sec)
+    d, sec = divmod(sec, 86400)
+    h, sec = divmod(sec, 3600)
+    parts = []
+    if d:
+        parts.append(f"{d} д")
+    if h:
+        parts.append(f"{h} ч")
+    parts.append(f"{sec // 60} мин")
+    return " ".join(parts)
+
+
+def unique(dest_dir, name):
+    base, ext = os.path.splitext(name)
+    cand, i = name, 1
+    while os.path.lexists(os.path.join(dest_dir, cand)):
+        cand = f"{base} ({i}){ext}"
+        i += 1
+    return os.path.join(dest_dir, cand)
+
+
+def dir_size(path):
+    total, stack = 0, [path]
+    while stack:
+        p = stack.pop()
+        try:
+            with os.scandir(p) as it:
+                for e in it:
+                    try:
+                        if e.is_dir(follow_symlinks=False):
+                            stack.append(e.path)
+                        else:
+                            total += e.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+    return total
+
+
+def lbl(text, cls=None, xalign=0.0, wrap=False):
+    lab = Gtk.Label(label=text, xalign=xalign)
+    if cls:
+        for c in cls.split():
+            lab.get_style_context().add_class(c)
+    if wrap:
+        lab.set_line_wrap(True)
+    return lab
+
+
+def lvl(frac, warn=0.75, crit=0.9):
+    return 2 if frac >= crit else (1 if frac >= warn else 0)
+
+
+def no_wheel(widget):
+    # колесо мыши листает страницу, а не крутит ползунок/список
+    def on_scroll(w, e):
+        w.stop_emission_by_name("scroll-event")
+        return False
+    widget.connect("scroll-event", on_scroll)
+
+
+def greeting():
+    h = time.localtime().tm_hour
+    return "Доброй ночи" if h < 5 else "Доброе утро" if h < 12 else "Добрый день" if h < 18 else "Добрый вечер"
+
+
+def ppd_set(prof):
+    r = sh(["powerprofilesctl", "set", prof], 5)
+    sh(["pkill", "-RTMIN+8", "waybar"], 2)  # обновить значок в панели
+    return bool(r and r.returncode == 0)
+
+
+# ================= сведения о системе =================
+def meminfo():
+    d = {}
+    for line in read("/proc/meminfo").splitlines():
+        k, _, v = line.partition(":")
+        parts = v.split()
+        if parts:
+            try:
+                d[k] = int(parts[0]) * 1024
+            except ValueError:
+                pass
+    return d
+
+
+def battery():
+    for b in sorted(glob.glob("/sys/class/power_supply/BAT*")):
+        cap = read(b + "/capacity")
+        if not cap.isdigit():
+            continue
+
+        def num(n):
+            try:
+                return int(read(os.path.join(b, n)))
+            except ValueError:
+                return None
+        full = num("energy_full") or num("charge_full")
+        design = num("energy_full_design") or num("charge_full_design")
+        now = num("energy_now") or num("charge_now")
+        rate = num("power_now") or num("current_now")
+        status = read(b + "/status")
+        eta = None
+        if rate and now is not None and full:
+            if status == "Discharging":
+                eta = now / rate
+            elif status == "Charging":
+                eta = max(full - now, 0) / rate
+            if eta is not None and eta > 48:
+                eta = None
+        return {"cap": int(cap), "status": status, "eta": eta, "cycles": num("cycle_count"),
+                "health": round(full * 100 / design) if full and design else None}
+    return None
+
+
+def temperature():
+    best = None
+    for z in glob.glob("/sys/class/thermal/thermal_zone*"):
+        try:
+            v = int(read(z + "/temp")) / 1000
+        except ValueError:
+            continue
+        if read(z + "/type") == "x86_pkg_temp":
+            return v
+        if v > 0 and (best is None or v > best):
+            best = v
+    return best
+
+
+def os_name():
+    for line in read("/etc/os-release").splitlines():
+        if line.startswith("PRETTY_NAME="):
+            return line.split("=", 1)[1].strip('"')
+    return "Linux"
+
+
+def cpu_model():
+    for line in read("/proc/cpuinfo").splitlines():
+        if line.startswith("model name"):
+            return re.sub(r"\s+", " ", line.split(":", 1)[1]).strip() + f" · {os.cpu_count()} потоков"
+    return f"{os.cpu_count()} потоков"
+
+
+def gpu_name():
+    vendors = {"0x8086": "Intel", "0x1002": "AMD", "0x10de": "NVIDIA"}
+    found = []
+    for card in sorted(glob.glob("/sys/class/drm/card[0-9]")):
+        v = read(card + "/device/vendor")
+        drv = ""
+        for line in read(card + "/device/uevent").splitlines():
+            if line.startswith("DRIVER="):
+                drv = line[7:]
+        name = vendors.get(v, v or "?") + (f" ({drv})" if drv else "")
+        if name not in found:
+            found.append(name)
+    return ", ".join(found) or "-"
+
+
+def hypr_version():
+    try:
+        d = json.loads(out(["hyprctl", "version", "-j"]))
+        return str(d.get("tag") or d.get("version") or "?")
+    except ValueError:
+        m = re.search(r"Hyprland\s+([\w.\-]+)", out(["hyprctl", "version"]))
+        return m.group(1) if m else "?"
+
+
+def wp_state(target):
+    o = out(["wpctl", "get-volume", target])
+    m = re.search(r"Volume:\s*([0-9.]+)", o)
+    if not m:
+        return None
+    return min(100, round(float(m.group(1)) * 100)), "[MUTED]" in o
+
+
+def get_brightness():
+    try:
+        return int(out(["brightnessctl", "-m", "-c", "backlight"]).split(",")[3].rstrip("%"))
+    except (IndexError, ValueError):
+        return None
+
+
+def list_walls():
+    try:
+        return [os.path.join(WALL, f) for f in sorted(os.listdir(WALL)) if f.lower().endswith(IMG_EXT)]
+    except OSError:
+        return []
+
+
+def make_thumb(path):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = re.sub(r"[^\w.-]", "_", os.path.basename(path)) + f"-{int(st.st_mtime)}-{st.st_size}.png"
+    tp = os.path.join(THUMBS, key)
+    if os.path.exists(tp):
+        return tp
+    try:
+        info = GdkPixbuf.Pixbuf.get_file_info(path)
+        fw, fh = info[1], info[2]
+        if not info[0] or fw <= 0 or fh <= 0:
+            return None
+        k = max(THW / fw, THH / fh)
+        tw, th = max(THW, int(fw * k + 0.5)), max(THH, int(fh * k + 0.5))
+        pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(path, tw, th, False)
+        pb = pb.new_subpixbuf((pb.get_width() - THW) // 2, (pb.get_height() - THH) // 2, THW, THH)
+        os.makedirs(THUMBS, exist_ok=True)
+        pb.savev(tp, "png", [], [])
+        return tp
+    except (GLib.Error, TypeError, ValueError):
+        return None
+
+
+def play_beep():
+    if not os.path.exists(BEEP):
+        rate, frames = 44100, bytearray()
+        for f, d in ((784, 0.16), (1047, 0.34)):
+            n = int(rate * d)
+            for i in range(n):
+                env = math.exp(-5 * i / n) * min(1.0, i / 200)
+                frames += struct.pack("<h", int(11000 * env * math.sin(2 * math.pi * f * i / rate)))
+        try:
+            with wave.open(BEEP, "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(rate)
+                w.writeframes(bytes(frames))
+        except OSError:
+            return
+    if not spawn(["paplay", BEEP]):
+        spawn(["pw-play", BEEP])
+
+
+def logout():
+    for args in (["hyprctl", "dispatch", "exit"], ["hyprctl", "dispatch", "hl.dsp.exit()"]):
+        r = sh(args, 3)
+        if r and r.returncode == 0 and r.stdout.strip().lower().startswith("ok"):
+            return
+    sid = os.environ.get("XDG_SESSION_ID")
+    spawn(["loginctl", "terminate-session", sid] if sid else
+          ["loginctl", "terminate-user", os.environ.get("USER", "")])
+
+
+# ================= сохранение настроек =================
+def ok_type(d, v):
+    if d is None:
+        return v is None or isinstance(v, dict)
+    if isinstance(d, bool):
+        return isinstance(v, bool)
+    if isinstance(d, (int, float)):
+        return isinstance(v, (int, float)) and not isinstance(v, bool)
+    return isinstance(v, type(d))
+
+
+def load_state():
+    st = json.loads(json.dumps(DEFAULTS))
+    try:
+        with open(STATE, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            for k, d in DEFAULTS.items():
+                if k in data and ok_type(d, data[k]):
+                    st[k] = data[k]
+    except (OSError, ValueError):
+        pass
+    return st
+
+
+def lua_value(v, ind=""):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        return f"{v:g}"
+    if isinstance(v, str):
+        return json.dumps(v, ensure_ascii=False)
+    inner = ind + "  "
+    return "{\n" + "".join(f"{inner}{k} = {lua_value(x, inner)},\n" for k, x in v.items()) + ind + "}"
+
+
+def lua_config(st):
+    # секции пишутся целиком, чтобы ничего не потерялось, даже если Hyprland заменяет таблицу
+    cfg = {
+        "general": {"gaps_in": st["gaps_in"], "gaps_out": st["gaps_out"], "border_size": st["border_size"],
+                    "col": {"active_border": f"rgba({st['accent']}ee)", "inactive_border": "rgba(3a4a33aa)"},
+                    "layout": "dwindle"},
+        "decoration": {"rounding": st["rounding"], "active_opacity": 1.0,
+                       "inactive_opacity": float(st["inactive_opacity"]),
+                       "blur": {"enabled": st["blur"], "size": 6, "passes": 3}},
+        "animations": {"enabled": st["animations"]},
+        "input": {"kb_layout": "us,ru", "kb_options": st["kb_toggle"], "follow_mouse": 1,
+                  "repeat_rate": st["repeat_rate"], "repeat_delay": st["repeat_delay"],
+                  "sensitivity": float(st["sensitivity"]),
+                  "touchpad": {"natural_scroll": st["natural_scroll"]}},
+    }
+    text = "-- Создано приложением «Настройки» (Super+Shift+I). Ручные правки будут перезаписаны.\n"
+    text += "hl.config(" + lua_value(cfg) + ")\n"
+    for name, sc in (st.get("scales") or {}).items():
+        text += (f"hl.monitor({{ output = {json.dumps(name)}, mode = \"preferred\", "
+                 f"position = \"auto\", scale = {float(sc):g} }})\n")
+    return text
+
+
+def save_state(st):
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    with open(STATE + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(st, f, ensure_ascii=False, indent=1)
+    os.replace(STATE + ".tmp", STATE)
+    os.makedirs(os.path.dirname(LUA), exist_ok=True)
+    with open(LUA + ".tmp", "w", encoding="utf-8") as f:
+        f.write(lua_config(st))
+    os.replace(LUA + ".tmp", LUA)
+
+
+def live_value(key, v):
+    if key == "accent":
+        return f"rgba({v}ee)"
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, float):
+        return f"{v:g}"
+    return str(v)
+
+
+# ================= виджеты =================
+class Ring(Gtk.DrawingArea):
+    COLORS = ((0.663, 0.800, 0.510), (0.847, 0.718, 0.424), (0.851, 0.545, 0.490))
+
+    def __init__(self, title, size=112):
+        super().__init__()
+        self.title, self.frac, self.text, self.level = title, 0.0, "…", 0
+        self.big = size >= 150
+        self.set_size_request(size, size)
+        self.get_style_context().add_class("ring")
+        self.connect("draw", self.on_draw)
+
+    def set(self, frac, text, level=0):
+        self.frac = max(0.0, min(1.0, frac))
+        self.text, self.level = text, level
+        self.queue_draw()
+
+    def on_draw(self, w, cr):
+        a = w.get_allocation()
+        cx, cy = a.width / 2, a.height / 2
+        r = min(a.width, a.height) / 2 - 8
+        cr.set_line_width(8 if self.big else 7)
+        cr.set_line_cap(ROUND_CAP)
+        cr.set_source_rgba(0.663, 0.800, 0.510, 0.14)
+        cr.arc(cx, cy, r, 0, 2 * math.pi)
+        cr.stroke()
+        if self.frac > 0.002:
+            cr.set_source_rgb(*self.COLORS[self.level])
+            cr.arc(cx, cy, r, -math.pi / 2, -math.pi / 2 + 2 * math.pi * self.frac)
+            cr.stroke()
+        lay = w.create_pango_layout("")
+        lay.set_alignment(Pango.Alignment.CENTER)
+        size = 22000 if self.big else 14000
+        lay.set_markup(f"<span size='{size}' weight='bold'>{GLib.markup_escape_text(self.text)}</span>\n"
+                       f"<span size='8000' foreground='#8a9a82'>{GLib.markup_escape_text(self.title)}</span>", -1)
+        _ink, log = lay.get_pixel_extents()
+        Gtk.render_layout(w.get_style_context(), cr, cx - log.width / 2 - log.x, cy - log.height / 2 - log.y, lay)
+        return False
+
+
+# ================= окно =================
+class Settings(Gtk.Window):
+    def __init__(self):
+        super().__init__(title="Настройки")
+        self.set_default_size(1020, 680)
+        self.set_decorated(False)
+        self.st = load_state()
+        self.save_id = 0
+        self.kw_failed = False
+        self.syncing = False
+        self.built = {}
+        self.widgets = {}
+        self.cpu_prev = None
+        self.toast_id = 0
+        self.wall_btns = []
+        self.swatches = []
+        self.prof_btns = {}
+        self.bat_rows = None
+        self.pomo = {"mode": "work", "left": 25 * 60, "run": False, "id": 0}
+        screen = self.get_screen()
+        vis = screen.get_rgba_visual()
+        if vis:
+            self.set_visual(vis)
+        apply_css(screen, CSS)
+
+        root = Gtk.Box(orientation=V)
+        self.add(root)
+        head = Gtk.EventBox()
+        head.connect("button-press-event", self.on_head_press)
+        hb = Gtk.Box(spacing=10)
+        hb.get_style_context().add_class("head")
+        hb.pack_start(lbl("◈", "logo"), False, False, 0)
+        hb.pack_start(lbl("Настройки", "apptitle"), False, False, 0)
+        self.crumb = lbl("", "crumb")
+        hb.pack_start(self.crumb, False, False, 0)
+        close = Gtk.Button()
+        close.add(Gtk.Image.new_from_icon_name("window-close-symbolic", Gtk.IconSize.BUTTON))
+        close.get_style_context().add_class("close")
+        close.set_tooltip_text("Закрыть (Esc)")
+        close.connect("clicked", lambda *_: self.destroy())
+        hb.pack_end(close, False, False, 0)
+        head.add(hb)
+        root.pack_start(head, False, False, 0)
+
+        body = Gtk.Box()
+        root.pack_start(body, True, True, 0)
+        side = Gtk.Box(orientation=V)
+        side.get_style_context().add_class("side")
+        side.set_size_request(212, -1)
+        self.side = Gtk.ListBox()
+        self.side.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        ss = Gtk.ScrolledWindow()
+        ss.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        ss.add(self.side)
+        side.pack_start(ss, True, True, 6)
+        side.pack_start(lbl("Super+Shift+I - открыть / закрыть", "sidefoot"), False, False, 0)
+        body.pack_start(side, False, False, 0)
+        self.stack = Gtk.Stack()
+        self.stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+        self.stack.set_transition_duration(140)
+        body.pack_start(self.stack, True, True, 0)
+        self.status = lbl("Изменения применяются сразу и сохраняются автоматически", "status")
+        self.status.set_ellipsize(Pango.EllipsizeMode.END)
+        root.pack_start(self.status, False, False, 0)
+
+        for key, title, icon in PAGES:
+            row = Gtk.ListBoxRow()
+            box = Gtk.Box(spacing=11)
+            img = Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.MENU)
+            img.set_pixel_size(16)
+            box.pack_start(img, False, False, 0)
+            box.pack_start(lbl(title), True, True, 0)
+            row.add(box)
+            row.key, row.title = key, title
+            self.side.add(row)
+        self.side.connect("row-selected", self.on_page)
+        self.connect("key-press-event", self.on_key)
+        self.connect("focus-in-event", lambda *_: self.set_urgency_hint(False))
+        self.connect("destroy", self.on_close)
+        GLib.timeout_add_seconds(2, self.tick)
+        self.side.select_row(self.side.get_row_at_index(0))
+
+    # ---------- общее ----------
+    def on_head_press(self, w, ev):
+        if ev.button == 1 and ev.type == Gdk.EventType.BUTTON_PRESS:
+            self.begin_move_drag(ev.button, int(ev.x_root), int(ev.y_root), ev.time)
+        return False
+
+    def on_close(self, *_):
+        if self.save_id:
+            GLib.source_remove(self.save_id)
+            self.save()
+
+    def say(self, text, err=False):
+        ctx = self.status.get_style_context()
+        (ctx.add_class if err else ctx.remove_class)("err")
+        self.status.set_text(text)
+        if self.toast_id:
+            GLib.source_remove(self.toast_id)
+        self.toast_id = GLib.timeout_add_seconds(5, self.clear_say)
+
+    def clear_say(self):
+        self.toast_id = 0
+        self.status.get_style_context().remove_class("err")
+        self.status.set_text("")
+        return False
+
+    def confirm(self, text, extra=None):
+        dlg = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.QUESTION,
+                                buttons=Gtk.ButtonsType.YES_NO, text=text)
+        if extra:
+            dlg.format_secondary_text(extra)
+        resp = dlg.run()
+        dlg.destroy()
+        return resp == Gtk.ResponseType.YES
+
+    def keyword(self, key, value):
+        def work():
+            r = sh(["hyprctl", "keyword", key, value], 3)
+            if not r or r.returncode != 0 or not r.stdout.strip().lower().startswith("ok"):
+                self.kw_failed = True
+        threading.Thread(target=work, daemon=True).start()
+
+    def set(self, key, value):
+        self.st[key] = value
+        if key in KEYWORDS:
+            self.keyword(KEYWORDS[key], live_value(key, value))
+        self.queue_save()
+
+    def queue_save(self):
+        if self.save_id:
+            GLib.source_remove(self.save_id)
+        self.save_id = GLib.timeout_add(500, self.save)
+
+    def save(self):
+        self.save_id = 0
+        try:
+            save_state(self.st)
+        except OSError as e:
+            self.say("Не удалось сохранить: " + str(e), True)
+            return False
+        if self.kw_failed:
+            # живое применение не сработало - перечитываем конфиг Hyprland целиком
+            self.kw_failed = False
+            fire(["hyprctl", "reload"])
+        return False
+
+    def apply_values(self, d):
+        self.syncing = True
+        for k, v in d.items():
+            w = self.widgets.get(k)
+            if isinstance(w, Gtk.Switch):
+                w.set_active(bool(v))
+            elif w is not None and hasattr(w, "scale"):
+                w.scale.set_value(v * 100 if k == "inactive_opacity" else v)
+        self.syncing = False
+        for k, v in d.items():
+            self.set(k, v)
+
+    # ---------- навигация ----------
+    def on_page(self, box, row):
+        if row is None:
+            return
+        key = row.key
+        if key not in self.built:
+            content = getattr(self, "build_" + key)()
+            sc = Gtk.ScrolledWindow()
+            sc.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            sc.add(content)
+            sc.show_all()
+            self.stack.add_named(sc, key)
+            self.built[key] = sc
+        self.stack.set_visible_child_name(key)
+        self.crumb.set_text("·  " + row.title)
+        self.refresh_page(key)
+
+    def step_page(self, d):
+        row = self.side.get_selected_row()
+        i = row.get_index() if row else 0
+        self.side.select_row(self.side.get_row_at_index((i + d) % len(PAGES)))
+
+    def on_key(self, w, ev):
+        k = Gdk.keyval_name(ev.keyval) or ""
+        ctrl = bool(ev.state & Gdk.ModifierType.CONTROL_MASK)
+        focus = self.get_focus()
+        if k == "Escape":
+            if isinstance(focus, Gtk.Entry) and focus.get_text():
+                focus.set_text("")
+            else:
+                self.destroy()
+            return True
+        if ctrl and k.lower() in ("q", "w"):
+            self.destroy()
+            return True
+        if ctrl and k in ("Tab", "Page_Down"):
+            self.step_page(1)
+            return True
+        if ctrl and k in ("ISO_Left_Tab", "Page_Up"):
+            self.step_page(-1)
+            return True
+        return False
+
+    def tick(self):
+        if self.get_visible():
+            name = self.stack.get_visible_child_name()
+            if name == "overview":
+                self.update_overview()
+            elif name == "power":
+                self.update_power()
+        return True
+
+    def refresh_page(self, key):
+        if key == "overview":
+            self.update_overview()
+        elif key == "power":
+            self.update_power()
+            bg(lambda: out(["powerprofilesctl", "get"]), self.mark_profile)
+        elif key == "network":
+            self.refresh_net()
+        elif key == "storage":
+            self.refresh_storage()
+        elif key == "wallpaper":
+            self.mark_wall(read(WALL_CUR))
+
+    # ---------- строительные блоки ----------
+    def page(self, title, sub=""):
+        box = Gtk.Box(orientation=V, spacing=4)
+        box.get_style_context().add_class("page")
+        box.pack_start(lbl(title, "ptitle"), False, False, 0)
+        box.sub = lbl(sub, "psub", wrap=True)
+        box.pack_start(box.sub, False, False, 0)
+        return box
+
+    def group(self, parent, title=None):
+        if title:
+            parent.pack_start(lbl(title.upper(), "gtitle"), False, False, 0)
+        g = Gtk.Box(orientation=V)
+        g.get_style_context().add_class("group")
+        parent.pack_start(g, False, False, 0)
+        return g
+
+    def row(self, g, title, desc=None, widget=None):
+        if g.get_children():
+            g.pack_start(Gtk.Separator(), False, False, 0)
+        r = Gtk.Box(spacing=14)
+        r.get_style_context().add_class("srow")
+        col = Gtk.Box(orientation=V, spacing=2)
+        col.set_valign(CENTER)
+        col.pack_start(lbl(title, "rtitle"), False, False, 0)
+        if desc:
+            d = lbl(desc, "rdesc", wrap=True)
+            d.set_max_width_chars(48)
+            col.pack_start(d, False, False, 0)
+        r.pack_start(col, True, True, 0)
+        if widget is not None:
+            widget.set_valign(CENTER)
+            r.pack_end(widget, False, False, 0)
+        g.pack_start(r, False, False, 0)
+        return r
+
+    def value_row(self, g, title, desc=None):
+        v = lbl("…", "val", xalign=1)
+        v.set_ellipsize(Pango.EllipsizeMode.END)
+        v.set_max_width_chars(46)
+        self.row(g, title, desc, v)
+        return v
+
+    def button(self, text, cb, icon=None, cls=None):
+        b = Gtk.Button()
+        box = Gtk.Box(spacing=6)
+        if icon:
+            box.pack_start(Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.BUTTON), False, False, 0)
+        b.text_label = Gtk.Label(label=text or "")
+        if text:
+            box.pack_start(b.text_label, False, False, 0)
+        b.add(box)
+        if cls:
+            for c in cls.split():
+                b.get_style_context().add_class(c)
+        b.connect("clicked", lambda *_: cb())
+        return b
+
+    def slider(self, lo, hi, step, value, fmt, cb, digits=0, width=230):
+        box = Gtk.Box(spacing=10)
+        sc = Gtk.Scale.new_with_range(H, lo, hi, step)
+        sc.set_draw_value(False)
+        sc.set_digits(digits)
+        sc.set_size_request(width, -1)
+        sc.set_value(value)
+        no_wheel(sc)
+        val = lbl(fmt(value), "val", xalign=1)
+        val.set_width_chars(7)
+        pend = {"id": 0}
+
+        def norm(x):
+            return round(x, digits) if digits else int(round(x))
+
+        def push(x):
+            pend["id"] = 0
+            cb(x)
+            return False
+
+        def changed(s):
+            x = norm(s.get_value())
+            val.set_text(fmt(x))
+            if self.syncing:
+                return
+            if pend["id"]:
+                GLib.source_remove(pend["id"])
+            pend["id"] = GLib.timeout_add(110, push, x)
+        sc.connect("value-changed", changed)
+        box.pack_start(sc, True, True, 0)
+        box.pack_start(val, False, False, 0)
+        box.scale = sc
+        return box
+
+    def add_slider(self, g, key, title, desc, lo, hi, step, fmt, digits=0):
+        s = self.slider(lo, hi, step, self.st[key], fmt, lambda v, k=key: self.set(k, v), digits)
+        self.widgets[key] = s
+        self.row(g, title, desc, s)
+
+    def add_switch(self, g, key, title, desc=None):
+        sw = Gtk.Switch()
+        sw.set_active(bool(self.st[key]))
+        sw.connect("notify::active", lambda w, _p, k=key: None if self.syncing else self.set(k, w.get_active()))
+        self.widgets[key] = sw
+        self.row(g, title, desc, sw)
+
+    def combo(self, items, active, cb, width=None):
+        c = Gtk.ComboBoxText()
+        for i, t in items:
+            c.append(i, t)
+        c.set_active_id(active)
+        if width:
+            c.set_size_request(width, -1)
+            for cell in c.get_cells():
+                cell.set_property("ellipsize", Pango.EllipsizeMode.END)
+        no_wheel(c)
+        c.connect("changed", lambda w: cb(w.get_active_id()) if w.get_active_id() is not None else None)
+        return c
+
+    # ================= Обзор =================
+    def build_overview(self):
+        p = self.page(f"{greeting()}, {getpass.getuser()}",
+                      f"{socket.gethostname()}  ·  {os_name()}  ·  {time.strftime('%d.%m.%Y')}")
+        rings = Gtk.Box(spacing=14)
+        rings.set_homogeneous(True)
+        rings.set_margin_top(14)
+        rings.set_margin_bottom(4)
+        self.r_cpu, self.r_ram = Ring("процессор"), Ring("память")
+        self.r_disk, self.r_temp, self.r_bat = Ring("диск /"), Ring("температура"), Ring("батарея")
+        for r in (self.r_cpu, self.r_ram, self.r_disk, self.r_temp, self.r_bat):
+            rings.pack_start(r, True, True, 0)
+        if battery() is None:
+            self.r_bat.set_no_show_all(True)
+        if temperature() is None:
+            self.r_temp.set_no_show_all(True)
+        p.pack_start(rings, False, False, 0)
+
+        g = self.group(p, "Система")
+        self.ov = {}
+        for key, title in (("os", "Система"), ("kernel", "Ядро"), ("cpu", "Процессор"), ("gpu", "Графика"),
+                           ("mem", "Память"), ("wm", "Hyprland"), ("pkgs", "Пакеты"), ("up", "Работает без перерыва")):
+            self.ov[key] = self.value_row(g, title)
+        self.ov["os"].set_text(os_name())
+        self.ov["kernel"].set_text(os.uname().release)
+        self.ov["cpu"].set_text(cpu_model())
+        self.ov["gpu"].set_text(gpu_name())
+        bg(hypr_version, self.ov["wm"].set_text)
+        bg(lambda: f"{len(out(['pacman', '-Qq'], 10).splitlines())} шт.", self.ov["pkgs"].set_text)
+
+        g = self.group(p, "Быстрые действия")
+        fb = Gtk.Box(spacing=8)
+        for text, icon, cb in (
+                ("Скриншот", "camera-photo-symbolic", self.screenshot),
+                ("Терминал", "utilities-terminal-symbolic", lambda: spawn(["alacritty"])),
+                ("Файлы", "system-file-manager-symbolic", lambda: spawn(["/usr/local/bin/files"])),
+                ("Обновить систему", "software-update-available-symbolic",
+                 lambda: in_terminal("sudo pacman -Syu", "Обновление системы"))):
+            fb.pack_start(self.button(text, cb, icon), False, False, 0)
+        r = Gtk.Box()
+        r.get_style_context().add_class("srow")
+        r.pack_start(fb, False, False, 0)
+        g.pack_start(r, False, False, 0)
+        self.cpu_usage()
+        return p
+
+    def cpu_usage(self):
+        try:
+            nums = [int(x) for x in read("/proc/stat").splitlines()[0].split()[1:]]
+        except (IndexError, ValueError):
+            return 0.0
+        idle = nums[3] + (nums[4] if len(nums) > 4 else 0)
+        total = sum(nums)
+        prev, self.cpu_prev = self.cpu_prev, (idle, total)
+        if not prev or total <= prev[1]:
+            return 0.0
+        return 1 - (idle - prev[0]) / (total - prev[1])
+
+    def update_overview(self):
+        if not hasattr(self, "r_cpu"):
+            return
+        c = self.cpu_usage()
+        self.r_cpu.set(c, f"{c * 100:.0f}%", lvl(c))
+        m = meminfo()
+        tot, av = m.get("MemTotal", 0), m.get("MemAvailable", 0)
+        if tot:
+            f = 1 - av / tot
+            self.r_ram.set(f, f"{f * 100:.0f}%", lvl(f))
+            self.ov["mem"].set_text(f"{human(tot - av)} из {human(tot)}")
+        try:
+            du = shutil.disk_usage("/")
+            f = du.used / du.total
+            self.r_disk.set(f, f"{f * 100:.0f}%", lvl(f, 0.8, 0.92))
+        except OSError:
+            pass
+        t = temperature()
+        if t is not None:
+            self.r_temp.set(t / 100, f"{t:.0f}°", lvl(t / 100, 0.7, 0.85))
+        b = battery()
+        if b:
+            self.r_bat.title = "заряжается" if b["status"] == "Charging" else "батарея"
+            self.r_bat.set(b["cap"] / 100, f"{b['cap']}%", 2 if b["cap"] <= 10 else 1 if b["cap"] <= 25 else 0)
+        try:
+            self.ov["up"].set_text(fmt_dur(float(read("/proc/uptime").split()[0])))
+        except (IndexError, ValueError):
+            pass
+
+    def screenshot(self):
+        d = os.path.join(HOME, "Pictures", "Screenshots")
+        spawn(["sh", "-c", f'mkdir -p "{d}"; sleep 0.4; f="{d}/$(date +%F_%H-%M-%S).png"; '
+                           'grim -g "$(slurp)" "$f" && wl-copy < "$f"'])
+        self.destroy()
+
+    # ================= Оформление =================
+    def build_appearance(self):
+        p = self.page("Оформление", "Окна, отступы и эффекты. Всё меняется сразу.")
+        g = self.group(p, "Цвет рамки активного окна")
+        box = Gtk.Box(spacing=10)
+        for hexc, name in ACCENTS:
+            b = Gtk.Button()
+            b.set_tooltip_text(name)
+            b.get_style_context().add_class("swatch")
+            tint(b, hexc)
+            b.connect("clicked", lambda w, c=hexc: self.pick_accent(c))
+            self.swatches.append((b, hexc))
+            box.pack_start(b, False, False, 0)
+        r = Gtk.Box()
+        r.get_style_context().add_class("srow")
+        r.pack_start(box, False, False, 0)
+        g.pack_start(r, False, False, 0)
+        self.mark_accent()
+
+        px = lambda v: f"{v} px"
+        g = self.group(p, "Окна")
+        self.add_slider(g, "gaps_in", "Отступ между окнами", None, 0, 30, 1, px)
+        self.add_slider(g, "gaps_out", "Отступ от краёв экрана", None, 0, 50, 1, px)
+        self.add_slider(g, "border_size", "Толщина рамки", None, 0, 6, 1, px)
+        self.add_slider(g, "rounding", "Скругление углов", None, 0, 24, 1, px)
+        s = self.slider(50, 100, 1, round(self.st["inactive_opacity"] * 100), lambda v: f"{v}%",
+                        lambda v: self.set("inactive_opacity", round(v / 100, 2)))
+        self.widgets["inactive_opacity"] = s
+        self.row(g, "Непрозрачность неактивных окон", "100% - окна совсем не просвечивают", s)
+
+        g = self.group(p, "Эффекты")
+        self.add_switch(g, "blur", "Размытие", "Красиво, но расходует видеокарту и батарею")
+        self.add_switch(g, "animations", "Анимации", "Плавное появление окон и смена рабочих столов")
+
+        g = self.group(p, "Готовые наборы")
+        box = Gtk.Box(spacing=8)
+        for name, vals in PRESETS:
+            box.pack_start(self.button(name, lambda v=vals, n=name: (self.apply_values(v), self.say("Набор: " + n))),
+                           False, False, 0)
+        box.pack_end(self.button("Сбросить всё", self.reset_look, "edit-undo-symbolic", "danger"), False, False, 0)
+        r = Gtk.Box()
+        r.get_style_context().add_class("srow")
+        r.pack_start(box, True, True, 0)
+        g.pack_start(r, False, False, 0)
+        return p
+
+    def pick_accent(self, c):
+        self.set("accent", c)
+        self.mark_accent()
+
+    def mark_accent(self):
+        for b, c in self.swatches:
+            ctx = b.get_style_context()
+            (ctx.add_class if c == self.st["accent"] else ctx.remove_class)("on")
+
+    def reset_look(self):
+        keys = ("gaps_in", "gaps_out", "border_size", "rounding", "blur", "animations", "inactive_opacity", "accent")
+        self.apply_values({k: DEFAULTS[k] for k in keys})
+        self.mark_accent()
+        self.say("Оформление сброшено")
+
+    # ================= Обои =================
+    def build_wallpaper(self):
+        p = self.page("Обои", "Картинки из ~/Pictures/wall.  Super+W - следующие.")
+        g = self.group(p, "Управление")
+        box = Gtk.Box(spacing=8)
+        box.pack_start(self.button("Следующие", self.wall_next, "go-next-symbolic"), False, False, 0)
+        box.pack_start(self.button("Случайные", self.random_wall, "media-playlist-shuffle-symbolic"), False, False, 0)
+        box.pack_start(self.button("Добавить…", self.wall_add, "list-add-symbolic"), False, False, 0)
+        box.pack_start(self.button("Папка", lambda: spawn(["/usr/local/bin/files", WALL]), "folder-open-symbolic"),
+                       False, False, 0)
+        self.row(g, "Действия", None, box)
+        mode = read(WALL_MODE) or "fill"
+        self.row(g, "Как показывать картинку", None, self.combo(
+            (("fill", "Заполнить экран"), ("fit", "Вписать целиком"), ("center", "По центру"),
+             ("tile", "Плиткой"), ("stretch", "Растянуть")), mode, self.set_wall_mode))
+        colors = Gtk.Box(spacing=8)
+        for c in BG_COLORS:
+            b = Gtk.Button()
+            b.get_style_context().add_class("swatch")
+            tint(b, c)
+            b.set_tooltip_text("#" + c)
+            b.connect("clicked", lambda w, col=c: self.wall_color(col))
+            colors.pack_start(b, False, False, 0)
+        self.row(g, "Сплошной цвет", "Вместо картинки - самый лёгкий вариант", colors)
+
+        p.pack_start(lbl("КАРТИНКИ", "gtitle"), False, False, 0)
+        self.wall_empty = lbl("В папке пока нет картинок - нажми «Добавить…».", "psub")
+        self.wall_empty.set_no_show_all(True)
+        p.pack_start(self.wall_empty, False, False, 0)
+        self.wall_flow = Gtk.FlowBox()
+        self.wall_flow.set_selection_mode(Gtk.SelectionMode.NONE)
+        self.wall_flow.set_homogeneous(True)
+        self.wall_flow.set_min_children_per_line(2)
+        self.wall_flow.set_max_children_per_line(6)
+        self.wall_flow.set_column_spacing(10)
+        self.wall_flow.set_row_spacing(10)
+        p.pack_start(self.wall_flow, False, False, 0)
+        self.load_walls()
+        return p
+
+    def load_walls(self):
+        for c in self.wall_flow.get_children():
+            self.wall_flow.remove(c)
+        files = list_walls()
+        self.wall_empty.set_visible(not files)
+        self.wall_btns, jobs = [], []
+        for path in files:
+            b = Gtk.Button()
+            b.get_style_context().add_class("wall")
+            b.set_tooltip_text(os.path.basename(path))
+            img = Gtk.Image.new_from_icon_name("image-x-generic-symbolic", Gtk.IconSize.DIALOG)
+            img.set_size_request(THW, THH)
+            b.add(img)
+            b.connect("clicked", lambda w, pth=path: self.wall_set(pth))
+            self.wall_flow.add(b)
+            self.wall_btns.append((b, path))
+            jobs.append((img, path))
+        self.mark_wall(read(WALL_CUR))
+        self.wall_flow.show_all()
+
+        def set_img(img, t):
+            img.set_from_file(t)
+            return False
+
+        def work():
+            for img, path in jobs:
+                t = make_thumb(path)
+                if t:
+                    GLib.idle_add(set_img, img, t)
+        threading.Thread(target=work, daemon=True).start()
+
+    def mark_wall(self, cur):
+        for b, pth in self.wall_btns:
+            ctx = b.get_style_context()
+            (ctx.add_class if pth == cur else ctx.remove_class)("on")
+
+    def write_cur(self, text):
+        try:
+            os.makedirs(os.path.dirname(WALL_CUR), exist_ok=True)
+            with open(WALL_CUR, "w", encoding="utf-8") as f:
+                f.write(text + "\n")
+            return True
+        except OSError as e:
+            self.say("Ошибка: " + str(e), True)
+            return False
+
+    def wall_set(self, path):
+        if self.write_cur(path):
+            spawn(["sh", WALL_SH])
+            self.mark_wall(path)
+
+    def wall_color(self, c):
+        if self.write_cur("color:" + c):
+            spawn(["sh", WALL_SH])
+            self.mark_wall("")
+
+    def wall_next(self):
+        spawn(["sh", WALL_SH, "next"])
+        GLib.timeout_add(500, lambda: self.mark_wall(read(WALL_CUR)) and False)
+
+    def random_wall(self):
+        files = list_walls()
+        if not files:
+            self.say("В ~/Pictures/wall нет картинок", True)
+            return
+        cur = read(WALL_CUR)
+        choice = [f for f in files if f != cur] or files
+        self.wall_set(random.choice(choice))
+
+    def set_wall_mode(self, mode):
+        try:
+            with open(WALL_MODE, "w") as f:
+                f.write(mode + "\n")
+        except OSError:
+            return
+        spawn(["sh", WALL_SH])
+
+    def wall_add(self):
+        dlg = Gtk.FileChooserDialog(title="Выбери картинки", transient_for=self, action=Gtk.FileChooserAction.OPEN)
+        dlg.add_buttons("Отмена", Gtk.ResponseType.CANCEL, "Добавить", Gtk.ResponseType.ACCEPT)
+        dlg.set_select_multiple(True)
+        flt = Gtk.FileFilter()
+        flt.set_name("Картинки")
+        for e in IMG_EXT:
+            flt.add_pattern("*" + e)
+            flt.add_pattern("*" + e.upper())
+        dlg.add_filter(flt)
+        start = os.path.join(HOME, "Downloads")
+        dlg.set_current_folder(start if os.path.isdir(start) else HOME)
+        files = dlg.get_filenames() if dlg.run() == Gtk.ResponseType.ACCEPT else []
+        dlg.destroy()
+        if not files:
+            return
+        os.makedirs(WALL, exist_ok=True)
+        n = 0
+        for f in files:
+            try:
+                shutil.copy2(f, unique(WALL, os.path.basename(f)))
+                n += 1
+            except OSError as e:
+                self.say("Ошибка: " + str(e), True)
+        if n:
+            self.say(f"Добавлено картинок: {n}")
+        self.load_walls()
+
+    # ================= Экран =================
+    def build_display(self):
+        p = self.page("Экран", "Яркость, ночной свет и масштаб")
+        g = self.group(p, "Яркость")
+        b = get_brightness()
+        if b is None:
+            self.row(g, "Яркость", "Подсветка не найдена (у внешних мониторов меняется кнопками на мониторе)")
+        else:
+            self.row(g, "Яркость экрана", None, self.slider(
+                1, 100, 1, b, lambda v: f"{v}%",
+                lambda v: fire(["brightnessctl", "-c", "backlight", "set", f"{v}%"])))
+
+        g = self.group(p, "Ночной свет")
+        if shutil.which("hyprsunset"):
+            sw = Gtk.Switch()
+            sw.set_active(bool(out(["pgrep", "-x", "hyprsunset"])))
+            sw.connect("notify::active", lambda w, _p: self.night(w.get_active()))
+            self.night_sw = sw
+            self.row(g, "Тёплые цвета", "Меньше синего света вечером. Действует до выхода из сеанса", sw)
+            self.row(g, "Теплота", "Меньше - теплее", self.slider(
+                2500, 6000, 100, self.st["night_temp"], lambda v: f"{v} K", self.night_temp))
+        else:
+            self.row(g, "Тёплые цвета", "Нужен маленький пакет hyprsunset",
+                     self.button("Установить", lambda: in_terminal("sudo pacman -S --needed hyprsunset",
+                                                                   "Установка hyprsunset"), "list-add-symbolic"))
+
+        g = self.group(p, "Мониторы")
+        try:
+            mons = json.loads(out(["hyprctl", "monitors", "-j"]) or "[]")
+        except ValueError:
+            mons = []
+        if not mons:
+            self.row(g, "Мониторы", "Не удалось получить список от Hyprland")
+        for m in mons:
+            name = m.get("name", "?")
+            sc = float(m.get("scale", 1) or 1)
+            items = [("1", "100%"), ("1.25", "125%"), ("1.5", "150%"), ("2", "200%")]
+            cur = f"{sc:g}"
+            if cur not in [i for i, _ in items]:
+                items.append((cur, f"{sc * 100:.0f}%"))
+            desc = f"{m.get('width', '?')}×{m.get('height', '?')} @ {float(m.get('refreshRate', 0)):.0f} Гц"
+            if m.get("description"):
+                desc += " · " + m["description"]
+            self.row(g, name, desc, self.combo(items, cur, lambda s, n=name: self.set_scale(n, s)))
+        return p
+
+    def night(self, on):
+        if on:
+            spawn(["hyprsunset", "-t", str(self.st["night_temp"])])
+            self.say("Ночной свет включён")
+        else:
+            fire(["pkill", "-x", "hyprsunset"])
+
+    def night_temp(self, v):
+        self.st["night_temp"] = v
+        self.queue_save()
+        if not getattr(self, "night_sw", None) or not self.night_sw.get_active():
+            return
+
+        def work():
+            r = sh(["hyprctl", "hyprsunset", "temperature", str(v)], 3)
+            if not r or r.returncode != 0 or "ok" not in r.stdout.lower():
+                sh(["pkill", "-x", "hyprsunset"])
+                time.sleep(0.3)
+                spawn(["hyprsunset", "-t", str(v)])
+        threading.Thread(target=work, daemon=True).start()
+
+    def set_scale(self, name, s):
+        self.st.setdefault("scales", {})[name] = float(s)
+        self.keyword("monitor", f"{name},preferred,auto,{s}")
+        self.queue_save()
+        self.say(f"Масштаб {name}: {float(s) * 100:.0f}%")
+
+    # ================= Звук =================
+    def build_sound(self):
+        p = self.page("Звук", "Громкость, устройства и проверка")
+        for target, title, kind in (("@DEFAULT_AUDIO_SINK@", "Вывод", "sink"),
+                                    ("@DEFAULT_AUDIO_SOURCE@", "Микрофон", "source")):
+            g = self.group(p, title)
+            st = wp_state(target)
+            if not st:
+                self.row(g, "Устройство не найдено", "Проверь, что запущены pipewire и wireplumber")
+                continue
+            self.row(g, "Громкость", None, self.slider(
+                0, 100, 1, st[0], lambda v: f"{v}%",
+                lambda v, t=target: fire(["wpctl", "set-volume", t, f"{v / 100:.2f}"])))
+            sw = Gtk.Switch()
+            sw.set_active(st[1])
+            sw.connect("notify::active",
+                       lambda w, _p, t=target: fire(["wpctl", "set-mute", t, "1" if w.get_active() else "0"]))
+            self.row(g, "Выключить", None, sw)
+            c = self.device_combo(kind)
+            if c:
+                self.row(g, "Устройство", None, c)
+        g = self.group(p, "Проверка")
+        self.row(g, "Тестовый звонок", "Короткий сигнал через текущий вывод",
+                 self.button("Проиграть", play_beep, "media-playback-start-symbolic"))
+        self.row(g, "Микшер приложений", "Громкость каждой программы отдельно",
+                 self.button("Открыть", lambda: spawn(["/usr/local/bin/audio-menu"]), "view-list-symbolic"))
+        return p
+
+    def device_combo(self, kind):
+        r = sh(["pactl", "--format=json", "list", kind + "s"])
+        try:
+            devs = json.loads(r.stdout) if r and r.returncode == 0 else []
+        except ValueError:
+            devs = []
+        devs = [d for d in devs if d.get("name") and not str(d["name"]).endswith(".monitor")]
+        if not devs:
+            return None
+        default = out(["pactl", "get-default-" + kind])
+        items = [(d["name"], d.get("description") or d["name"]) for d in devs]
+        return self.combo(items, default, lambda n: fire(["pactl", "set-default-" + kind, n]), width=270)
+
+    # ================= Клавиатура и мышь =================
+    def build_input(self):
+        p = self.page("Клавиатура и мышь", "Раскладки: English и Русский")
+        g = self.group(p, "Клавиатура")
+        self.row(g, "Смена раскладки", "Super+Space работает всегда", self.combo(
+            KB_TOGGLES, self.st["kb_toggle"], lambda v: self.set("kb_toggle", v)))
+        self.add_slider(g, "repeat_rate", "Скорость автоповтора", "Сколько символов в секунду при удержании клавиши",
+                        10, 80, 1, lambda v: f"{v}/с")
+        self.add_slider(g, "repeat_delay", "Задержка автоповтора", "Через сколько начинается повтор",
+                        150, 800, 10, lambda v: f"{v} мс")
+        test = Gtk.Entry()
+        test.set_placeholder_text("Попробуй печатать здесь…")
+        test.set_width_chars(28)
+        self.row(g, "Проверка", None, test)
+        g = self.group(p, "Мышь и тачпад")
+        self.add_slider(g, "sensitivity", "Чувствительность", "0 - как в системе по умолчанию",
+                        -1, 1, 0.05, lambda v: f"{v:+.2f}", digits=2)
+        self.add_switch(g, "natural_scroll", "Естественная прокрутка тачпада", "Контент едет за пальцами, как на телефоне")
+        return p
+
+    # ================= Питание =================
+    def build_power(self):
+        p = self.page("Питание", "Профиль работы, батарея и сеанс")
+        g = self.group(p, "Профиль питания")
+        tiles = Gtk.Box(spacing=10)
+        tiles.set_homogeneous(True)
+        for prof, icon, name, desc in PROFILES:
+            b = Gtk.Button()
+            b.get_style_context().add_class("tile")
+            col = Gtk.Box(orientation=V, spacing=4)
+            img = Gtk.Image.new_from_icon_name(icon, Gtk.IconSize.DND)
+            img.set_pixel_size(26)
+            col.pack_start(img, False, False, 0)
+            col.pack_start(lbl(name, "rtitle", xalign=0.5), False, False, 0)
+            col.pack_start(lbl(desc, "rdesc", xalign=0.5), False, False, 0)
+            b.add(col)
+            b.connect("clicked", lambda w, pr=prof: self.set_profile(pr))
+            tiles.pack_start(b, True, True, 0)
+            self.prof_btns[prof] = b
+        r = Gtk.Box()
+        r.get_style_context().add_class("srow")
+        r.pack_start(tiles, True, True, 0)
+        g.pack_start(r, False, False, 0)
+
+        if battery():
+            g = self.group(p, "Батарея")
+            self.bat_rows = {}
+            for key, title, desc in (("cap", "Заряд", None), ("status", "Состояние", None),
+                                     ("eta", "Осталось", "Примерно, по текущему расходу"),
+                                     ("health", "Здоровье", "Ёмкость относительно новой батареи"),
+                                     ("cycles", "Циклов зарядки", None)):
+                self.bat_rows[key] = self.value_row(g, title, desc)
+
+        g = self.group(p, "Сеанс")
+        box = Gtk.Box(spacing=8)
+        for text, icon, act, cls in (("Сон", "weather-clear-night-symbolic", "suspend", None),
+                                     ("Выйти", "system-log-out-symbolic", "exit", None),
+                                     ("Перезагрузка", "system-reboot-symbolic", "reboot", None),
+                                     ("Выключение", "system-shutdown-symbolic", "poweroff", "danger")):
+            box.pack_start(self.button(text, lambda a=act: self.session(a), icon, cls), False, False, 0)
+        r = Gtk.Box()
+        r.get_style_context().add_class("srow")
+        r.pack_start(box, False, False, 0)
+        g.pack_start(r, False, False, 0)
+        return p
+
+    def mark_profile(self, cur):
+        for prof, b in self.prof_btns.items():
+            ctx = b.get_style_context()
+            (ctx.add_class if prof == cur else ctx.remove_class)("on")
+
+    def set_profile(self, prof):
+        def done(ok):
+            if ok:
+                self.mark_profile(prof)
+                self.say("Профиль: " + dict((p[0], p[2]) for p in PROFILES)[prof])
+            else:
+                self.say("Не удалось переключить профиль (служба power-profiles-daemon?)", True)
+        bg(lambda: ppd_set(prof), done)
+
+    def update_power(self):
+        if not self.bat_rows:
+            return
+        b = battery()
+        if not b:
+            return
+        r = self.bat_rows
+        r["cap"].set_text(f"{b['cap']}%")
+        r["status"].set_text(STATUS_RU.get(b["status"], b["status"] or "-"))
+        r["eta"].set_text(fmt_dur(b["eta"] * 3600) if b["eta"] else "-")
+        r["health"].set_text(f"{b['health']}%" if b["health"] else "-")
+        r["cycles"].set_text(str(b["cycles"]) if b["cycles"] else "-")
+
+    def session(self, act):
+        names = {"reboot": "Перезагрузить компьютер?", "poweroff": "Выключить компьютер?", "exit": "Выйти из сеанса?"}
+        if act in names and not self.confirm(names[act], "Несохранённая работа в программах пропадёт."):
+            return
+        if act == "exit":
+            logout()
+        else:
+            spawn(["systemctl", act])
+        self.destroy()
+
+    # ================= Сеть =================
+    def build_network(self):
+        p = self.page("Сеть", "Подключение, Wi-Fi и проверка связи")
+        g = self.group(p, "Состояние")
+        self.net_name = self.value_row(g, "Подключение")
+        self.net_ip = self.value_row(g, "IP-адрес")
+        self.net_dev = self.value_row(g, "Устройство")
+        self.value_row(g, "Имя компьютера").set_text(socket.gethostname())
+        g = self.group(p, "Wi-Fi")
+        self.wifi_guard = False
+        self.wifi_sw = Gtk.Switch()
+        self.wifi_sw.connect("notify::active", self.on_wifi)
+        self.row(g, "Wi-Fi", "Включить или выключить беспроводной модуль", self.wifi_sw)
+        self.row(g, "Сети поблизости", "Откроется меню Wi-Fi из панели",
+                 self.button("Выбрать сеть…", lambda: spawn(["/usr/local/bin/network-menu"]), "network-wireless-symbolic"))
+        g = self.group(p, "Проверка")
+        self.ping_lbl = lbl("-", "val", xalign=1)
+        box = Gtk.Box(spacing=12)
+        box.pack_start(self.ping_lbl, False, False, 0)
+        box.pack_start(self.button("Проверить", self.ping, "emblem-synchronizing-symbolic"), False, False, 0)
+        self.row(g, "Связь с интернетом", "Пинг до 1.1.1.1", box)
+        return p
+
+    def refresh_net(self):
+        def work():
+            info = {"name": "Нет подключения", "ip": "-", "dev": "-", "radio": None}
+            o = out(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device", "status"], 5, C_ENV)
+            for line in o.splitlines():
+                f = [x.replace("\\:", ":") for x in re.split(r"(?<!\\):", line)]
+                if len(f) >= 4 and f[2] == "connected" and f[1] in ("wifi", "ethernet"):
+                    info["name"] = f[3] + ("  (Wi-Fi)" if f[1] == "wifi" else "  (кабель)")
+                    info["dev"] = f[0]
+                    for l2 in out(["nmcli", "-t", "-f", "IP4.ADDRESS", "device", "show", f[0]], 5, C_ENV).splitlines():
+                        parts = l2.split(":", 1)
+                        if len(parts) == 2 and parts[1]:
+                            info["ip"] = parts[1].split("/")[0]
+                            break
+                    break
+            radio = out(["nmcli", "radio", "wifi"], 5, C_ENV)
+            info["radio"] = (radio == "enabled") if radio else None
+            return info
+
+        def done(info):
+            self.net_name.set_text(info["name"])
+            self.net_ip.set_text(info["ip"])
+            self.net_dev.set_text(info["dev"])
+            self.wifi_guard = True
+            self.wifi_sw.set_active(bool(info["radio"]))
+            self.wifi_guard = False
+            self.wifi_sw.set_sensitive(info["radio"] is not None)
+        bg(work, done)
+
+    def on_wifi(self, sw, _p):
+        if self.wifi_guard:
+            return
+        fire(["nmcli", "radio", "wifi", "on" if sw.get_active() else "off"])
+        self.say("Включаю Wi-Fi…" if sw.get_active() else "Wi-Fi выключен")
+        GLib.timeout_add(2500, lambda: self.refresh_net() and False)
+
+    def ping(self):
+        self.ping_lbl.set_text("проверяю…")
+
+        def work():
+            r = sh(["ping", "-c", "3", "-W", "2", "1.1.1.1"], 12, C_ENV)
+            if r is None:
+                return "ping недоступен"
+            m = re.search(r"= [\d.]+/([\d.]+)/", r.stdout)
+            if r.returncode == 0 and m:
+                return f"есть, {float(m.group(1)):.0f} мс"
+            return "нет связи"
+        bg(work, self.ping_lbl.set_text)
+
+    # ================= Хранилище =================
+    def build_storage(self):
+        p = self.page("Хранилище", "Место на дисках и уборка")
+        g = self.group(p, "Диски")
+        mounts = [("/", "Система")]
+        try:
+            if os.stat(HOME).st_dev != os.stat("/").st_dev:
+                mounts.append((HOME, "Домашняя папка"))
+        except OSError:
+            pass
+        for line in read("/proc/mounts").splitlines():
+            parts = line.split()
+            if len(parts) > 1 and parts[1].startswith(("/run/media/", "/media/")):
+                mp = parts[1].replace("\\040", " ")
+                mounts.append((mp, os.path.basename(mp)))
+        for path, title in mounts:
+            self.disk_row(g, path, title)
+
+        g = self.group(p, "Что занимает место")
+        self.sizes = []
+        for title, path in (("Кэш программ", os.path.join(HOME, ".cache")), ("Корзина", TRASH),
+                            ("Загрузки", os.path.join(HOME, "Downloads")), ("Кэш pacman", "/var/cache/pacman/pkg")):
+            self.sizes.append((self.value_row(g, title, path.replace(HOME, "~", 1)), path))
+
+        g = self.group(p, "Уборка")
+        for title, desc, text, cb, cls in (
+                ("Кэш программ", "Миниатюры, кэш браузера и т.п. Пересоздаётся сам", "Очистить", self.clean_cache, None),
+                ("Корзина", "Удалить всё из корзины навсегда", "Очистить", self.empty_trash, "danger"),
+                ("Кэш pacman", "Старые версии скачанных пакетов", "Очистить",
+                 lambda: in_terminal("sudo pacman -Sc", "Кэш pacman"), None),
+                ("Ненужные пакеты", "Зависимости, которые больше ничему не нужны", "Найти и удалить",
+                 lambda: in_terminal('o="$(pacman -Qdtq)"; if [ -n "$o" ]; then sudo pacman -Rns $o; '
+                                     'else echo "Лишних пакетов нет"; fi', "Ненужные пакеты"), None),
+                ("Системный журнал", "Ужать логи до 50 МБ", "Ужать",
+                 lambda: in_terminal("sudo journalctl --vacuum-size=50M", "Журнал"), None),
+                ("Обновление системы", "Arch - rolling: обновляйся регулярно", "Обновить",
+                 lambda: in_terminal("sudo pacman -Syu", "Обновление системы"), "accent")):
+            self.row(g, title, desc, self.button(text, cb, cls=cls))
+        return p
+
+    def disk_row(self, g, path, title):
+        try:
+            du = shutil.disk_usage(path)
+        except OSError:
+            return
+        f = du.used / du.total if du.total else 0
+        box = Gtk.Box(orientation=V, spacing=4)
+        box.set_size_request(300, -1)
+        bar = Gtk.ProgressBar()
+        bar.set_fraction(f)
+        if f > 0.9:
+            bar.get_style_context().add_class("crit")
+        elif f > 0.75:
+            bar.get_style_context().add_class("warn")
+        box.pack_start(bar, False, False, 0)
+        box.pack_start(lbl(f"{human(du.used)} из {human(du.total)}  ·  свободно {human(du.free)}", "rdesc", xalign=1),
+                       False, False, 0)
+        self.row(g, title, path.replace(HOME, "~", 1), box)
+
+    def refresh_storage(self):
+        for v, _ in self.sizes:
+            v.set_text("считаю…")
+
+        def work():
+            return [dir_size(path) if os.path.isdir(path) else 0 for _, path in self.sizes]
+
+        def done(res):
+            for (v, _), n in zip(self.sizes, res):
+                v.set_text(human(n))
+        bg(work, done)
+
+    def clean_cache(self):
+        if not self.confirm("Очистить кэш программ (~/.cache)?",
+                            "Программы пересоздадут его сами, первые запуски могут быть чуть медленнее. "
+                            "Лучше закрыть браузер перед очисткой."):
+            return
+        keep = {"wallpaper", NAME}
+
+        def work():
+            base = os.path.join(HOME, ".cache")
+            freed = 0
+            try:
+                names = os.listdir(base)
+            except OSError:
+                return 0
+            for n in names:
+                if n in keep:
+                    continue
+                pth = os.path.join(base, n)
+                try:
+                    if os.path.isdir(pth) and not os.path.islink(pth):
+                        size = dir_size(pth)
+                        shutil.rmtree(pth, ignore_errors=True)
+                    else:
+                        size = os.lstat(pth).st_size
+                        os.remove(pth)
+                    freed += size
+                except OSError:
+                    pass
+            return freed
+        self.say("Чищу кэш…")
+        bg(work, lambda n: (self.say("Освобождено: " + human(n)), self.refresh_storage()))
+
+    def empty_trash(self):
+        if not self.confirm("Очистить корзину насовсем?"):
+            return
+
+        def work():
+            for d in ("files", "info"):
+                base = os.path.join(TRASH, d)
+                try:
+                    names = os.listdir(base)
+                except OSError:
+                    continue
+                for n in names:
+                    pth = os.path.join(base, n)
+                    try:
+                        if os.path.isdir(pth) and not os.path.islink(pth):
+                            shutil.rmtree(pth)
+                        else:
+                            os.remove(pth)
+                    except OSError:
+                        pass
+        bg(work, lambda _r: (self.say("Корзина пуста"), self.refresh_storage()))
+
+    # ================= Горячие клавиши =================
+    def build_keys(self):
+        p = self.page("Горячие клавиши", "Super - клавиша с логотипом Windows")
+        e = Gtk.SearchEntry()
+        e.set_placeholder_text("Найти действие или клавишу…")
+        e.set_margin_top(10)
+        e.set_margin_bottom(6)
+        p.pack_start(e, False, False, 0)
+        g = Gtk.Box(orientation=V)
+        g.get_style_context().add_class("group")
+        p.pack_start(g, False, False, 0)
+        rows = []
+        for keys, desc in HOTKEYS:
+            r = Gtk.Box(spacing=12)
+            r.get_style_context().add_class("krow")
+            kb = Gtk.Box(spacing=4)
+            kb.set_size_request(250, -1)
+            for i, part in enumerate(keys.split("+")):
+                if i:
+                    kb.pack_start(lbl("+", "rdesc"), False, False, 0)
+                kb.pack_start(lbl(part, "kbd", xalign=0.5), False, False, 0)
+            r.pack_start(kb, False, False, 0)
+            r.pack_start(lbl(desc, "rtitle", wrap=True), True, True, 0)
+            g.pack_start(r, False, False, 0)
+            rows.append((r, (keys + " " + desc).lower()))
+
+        def filt(entry):
+            q = entry.get_text().strip().lower()
+            for r, t in rows:
+                r.set_visible(q in t)
+        e.connect("search-changed", filt)
+        return p
+
+    # ================= Разное =================
+    def build_fun(self):
+        p = self.page("Разное", "Полезные мелочи и немного веселья")
+        g = self.group(p, "Режимы")
+        sw = Gtk.Switch()
+        sw.set_active(bool(self.st.get("game")))
+        sw.connect("notify::active", lambda w, _p: self.toggle_game(w.get_active()))
+        self.row(g, "Игровой режим", "Без отступов, размытия и анимаций + профиль «Мощность». "
+                                     "Выключишь - всё вернётся как было", sw)
+        self.row(g, "Панель сверху", "Спрятать или вернуть waybar",
+                 self.button("Скрыть / показать", lambda: fire(["pkill", "-SIGUSR1", "-x", "waybar"]), "view-conceal-symbolic"))
+
+        g = self.group(p, "Помидор - таймер концентрации")
+        box = Gtk.Box(spacing=26)
+        box.get_style_context().add_class("srow")
+        self.pomo_ring = Ring("работа", 170)
+        box.pack_start(self.pomo_ring, False, False, 0)
+        ctl = Gtk.Box(orientation=V, spacing=10)
+        ctl.set_valign(CENTER)
+        ctl.pack_start(lbl("Работай, пока идёт таймер, потом отдохни. Звонок прозвучит сам, "
+                           "а рабочий стол с Настройками подсветится в панели.", "rdesc", wrap=True), False, False, 0)
+        self.pomo_combo = self.combo((("25/5", "25 мин работы / 5 отдыха"), ("50/10", "50 / 10"),
+                                      ("15/3", "15 / 3")), "25/5", lambda _v: self.pomo_reset())
+        self.pomo_combo.set_halign(Gtk.Align.START)
+        ctl.pack_start(self.pomo_combo, False, False, 0)
+        btns = Gtk.Box(spacing=8)
+        self.pomo_btn = self.button("Старт", self.pomo_toggle, "media-playback-start-symbolic", "accent")
+        btns.pack_start(self.pomo_btn, False, False, 0)
+        btns.pack_start(self.button("Сброс", self.pomo_reset, "view-refresh-symbolic"), False, False, 0)
+        btns.pack_start(self.button("Пропустить", self.pomo_skip, "media-skip-forward-symbolic"), False, False, 0)
+        ctl.pack_start(btns, False, False, 0)
+        box.pack_start(ctl, True, True, 0)
+        g.pack_start(box, False, False, 0)
+        self.pomo_reset()
+
+        g = self.group(p, "Случайность")
+        box = Gtk.Box(spacing=18)
+        box.get_style_context().add_class("srow")
+        self.dice = lbl("⚄", "dice", xalign=0.5)
+        self.dice.set_width_chars(2)
+        box.pack_start(self.dice, False, False, 0)
+        col = Gtk.Box(orientation=V, spacing=8)
+        col.set_valign(CENTER)
+        self.chance = lbl("Не знаешь, что выбрать? Доверься случаю.", "chance")
+        col.pack_start(self.chance, False, False, 0)
+        bb = Gtk.Box(spacing=8)
+        bb.pack_start(self.button("Бросить кубик", self.roll), False, False, 0)
+        bb.pack_start(self.button("Подбросить монетку", self.coin), False, False, 0)
+        bb.pack_start(self.button("Число 1-100", lambda: self.chance.set_text(f"Число: {random.randint(1, 100)}")),
+                      False, False, 0)
+        col.pack_start(bb, False, False, 0)
+        box.pack_start(col, True, True, 0)
+        g.pack_start(box, False, False, 0)
+
+        g = self.group(p, "Совет")
+        self.tip = lbl(random.choice(TIPS), "tip", wrap=True)
+        self.tip.set_max_width_chars(60)
+        box = Gtk.Box(spacing=12)
+        box.get_style_context().add_class("srow")
+        box.pack_start(self.tip, True, True, 0)
+        box.pack_end(self.button("Ещё", self.next_tip, "go-next-symbolic"), False, False, 0)
+        g.pack_start(box, False, False, 0)
+
+        g = self.group(p, "Для красоты")
+        box = Gtk.Box(spacing=8)
+        box.pack_start(self.button("Визуализатор cava", lambda: spawn(["alacritty", "-e", "cava"]),
+                                   "audio-x-generic-symbolic"), False, False, 0)
+        box.pack_start(self.button("fastfetch", lambda: spawn(["alacritty", "-e", "sh",
+                                                               os.path.join(HOME, ".config", "fastfetch", "show.sh")]),
+                                   "utilities-terminal-symbolic"), False, False, 0)
+        box.pack_start(self.button("Случайные обои", self.random_wall, "media-playlist-shuffle-symbolic"),
+                       False, False, 0)
+        r = Gtk.Box()
+        r.get_style_context().add_class("srow")
+        r.pack_start(box, False, False, 0)
+        g.pack_start(r, False, False, 0)
+        return p
+
+    def toggle_game(self, on):
+        if self.syncing:
+            return
+        if on:
+            if not self.st.get("game"):
+                backup = {k: self.st[k] for k in GAME}
+                backup["profile"] = out(["powerprofilesctl", "get"])
+                self.st["game"] = backup
+            self.apply_values(GAME)
+            threading.Thread(target=ppd_set, args=("performance",), daemon=True).start()
+            self.say("Игровой режим включён")
+        else:
+            b = dict(self.st.get("game") or {})
+            self.st["game"] = None
+            prof = b.pop("profile", "")
+            self.apply_values({k: b.get(k, DEFAULTS[k]) for k in GAME})
+            if prof:
+                threading.Thread(target=ppd_set, args=(prof,), daemon=True).start()
+            self.say("Игровой режим выключен - всё как было")
+        self.queue_save()
+
+    def pomo_lens(self):
+        try:
+            w, b = (int(x) for x in (self.pomo_combo.get_active_id() or "25/5").split("/"))
+        except ValueError:
+            w, b = 25, 5
+        return {"work": w * 60, "break": b * 60}
+
+    def pomo_draw(self):
+        s = self.pomo
+        total = self.pomo_lens()[s["mode"]]
+        m, sec = divmod(max(s["left"], 0), 60)
+        self.pomo_ring.title = "работа" if s["mode"] == "work" else "перерыв"
+        self.pomo_ring.set(s["left"] / total if total else 0, f"{m:02d}:{sec:02d}", 0 if s["mode"] == "work" else 1)
+
+    def pomo_toggle(self):
+        s = self.pomo
+        s["run"] = not s["run"]
+        self.pomo_btn.text_label.set_text("Пауза" if s["run"] else "Продолжить")
+        if s["run"] and not s["id"]:
+            s["id"] = GLib.timeout_add_seconds(1, self.pomo_tick)
+
+    def pomo_tick(self):
+        s = self.pomo
+        if not s["run"]:
+            s["id"] = 0
+            return False
+        s["left"] -= 1
+        if s["left"] <= 0:
+            play_beep()
+            self.set_urgency_hint(True)
+            s["mode"] = "break" if s["mode"] == "work" else "work"
+            s["left"] = self.pomo_lens()[s["mode"]]
+            self.say("Время отдохнуть!" if s["mode"] == "break" else "Перерыв окончен - за дело!")
+        self.pomo_draw()
+        return True
+
+    def pomo_reset(self):
+        s = self.pomo
+        s["run"], s["mode"] = False, "work"
+        s["left"] = self.pomo_lens()["work"]
+        self.pomo_btn.text_label.set_text("Старт")
+        self.pomo_draw()
+
+    def pomo_skip(self):
+        s = self.pomo
+        s["mode"] = "break" if s["mode"] == "work" else "work"
+        s["left"] = self.pomo_lens()[s["mode"]]
+        self.pomo_draw()
+
+    def roll(self):
+        faces = "⚀⚁⚂⚃⚄⚅"
+        n = {"k": 0}
+
+        def step():
+            n["k"] += 1
+            v = random.randrange(6)
+            self.dice.set_text(faces[v])
+            if n["k"] >= 10:
+                self.chance.set_text(f"Выпало: {v + 1}")
+                return False
+            return True
+        GLib.timeout_add(55, step)
+
+    def coin(self):
+        n = {"k": 0}
+
+        def step():
+            n["k"] += 1
+            self.chance.set_text("Орёл…" if n["k"] % 2 else "Решка…")
+            if n["k"] >= 8:
+                self.chance.set_text("Выпало: " + random.choice(("Орёл", "Решка")))
+                return False
+            return True
+        GLib.timeout_add(90, step)
+
+    def next_tip(self):
+        cur = self.tip.get_text()
+        self.tip.set_text(random.choice([t for t in TIPS if t != cur]))
+
+
+# ================= запуск =================
+def running():
+    try:
+        with open(LOCK) as f:
+            pid = int(f.read().strip())
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return pid if NAME.encode() in f.read() else 0
+    except Exception:
+        return 0
+
+
+def drop_lock():
+    try:
+        os.remove(LOCK)
+    except OSError:
+        pass
+
+
+def main():
+    GLib.set_prgname(NAME)
+    GLib.set_application_name("Настройки")
+    pid = running()
+    if pid:
+        try:
+            os.kill(pid, 15)
+        except OSError:
+            pass
+        drop_lock()
+        return
+    w = Settings()
+
+    def on_destroy(*_):
+        drop_lock()
+        Gtk.main_quit()
+    w.connect("destroy", on_destroy)
+    w.show_all()
+    try:
+        with open(LOCK, "w") as f:
+            f.write(str(os.getpid()))
+    except OSError:
+        pass
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()
+SETTINGS_EOF
+chmod 755 /usr/local/bin/hypr-settings
+
 # ================= конфиги пользователя =================
 # w ФАЙЛ - записать stdin в файл (старую версию один раз сохраняет в .bak)
 w() {
@@ -3365,7 +4926,7 @@ local mod = "SUPER"
 hl.monitor({ output = "", mode = "preferred", position = "auto", scale = "auto" })
 
 hl.on("hyprland.start", function()
-  hl.exec_cmd("dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP")
+  hl.exec_cmd("dbus-update-activation-environment --systemd --all")
   hl.exec_cmd("sh ~/.config/hypr/wallpaper.sh")
   hl.exec_cmd("waybar")
   hl.exec_cmd("lxqt-policykit-agent")
@@ -3421,6 +4982,7 @@ hl.bind(mod .. " + W", hl.dsp.exec_cmd("sh ~/.config/hypr/wallpaper.sh next"))
 hl.bind(mod .. " + Q", hl.dsp.window.close())
 hl.bind(mod .. " + SHIFT + Q", hl.dsp.window.close(), { repeating = true })
 hl.bind(mod .. " + SHIFT + Escape", hl.dsp.exec_cmd("/usr/local/bin/power-menu"))
+hl.bind(mod .. " + SHIFT + I", hl.dsp.exec_cmd("/usr/local/bin/hypr-settings"))
 hl.bind(mod .. " + F", hl.dsp.window.fullscreen({ mode = "fullscreen", action = "toggle" }))
 hl.bind(mod .. " + V", hl.dsp.window.float({ action = "toggle" }))
 
@@ -3460,6 +5022,10 @@ hl.window_rule({ name = "float-performance-menu", match = { class = "^(performan
 hl.window_rule({ name = "float-audio-menu", match = { class = "^(audio-menu)$" }, float = true })
 hl.window_rule({ name = "float-network-menu", match = { class = "^(network-menu)$" }, float = true })
 hl.window_rule({ name = "float-year-calendar", match = { class = "^(year-calendar)$" }, float = true })
+hl.window_rule({ name = "float-hypr-settings", match = { class = "^(hypr-settings)$" }, float = true })
+
+-- значения из приложения «Настройки» (Super+Shift+I); если файла нет - ничего не случится
+pcall(function() dofile(os.getenv("HOME") .. "/.config/hypr/settings.lua") end)
 EOF
 
 # ---------- alacritty ----------
@@ -3569,16 +5135,15 @@ w "$H/.config/waybar/config.jsonc" <<'EOF'
     "tooltip": true
   },
   "network": {
-    "format-wifi": "{icon}  {essid}",
-    "format-ethernet": "󰈀  Кабель",
-    "format-linked": "󰈀  Нет IP",
-    "format-disconnected": "󰤮  Нет сети",
-    "format-disabled": "󰤮  Выкл",
+    "format-wifi": "{icon}",
+    "format-ethernet": "󰈀",
+    "format-linked": "󰈀",
+    "format-disconnected": "󰤮",
+    "format-disabled": "󰤮",
     "format-icons": ["󰤯", "󰤟", "󰤢", "󰤥", "󰤨"],
     "tooltip-format-wifi": "{essid} · {signalStrength}%\n{ipaddr}",
     "tooltip-format-ethernet": "{ifname}\n{ipaddr}",
     "tooltip-format-disconnected": "Нет подключения",
-    "max-length": 22,
     "interval": 5,
     "on-click": "/usr/local/bin/network-menu"
   },
@@ -3611,9 +5176,12 @@ w "$H/.config/waybar/config.jsonc" <<'EOF'
     }
   },
   "custom/performance": {
-    "format": "󱐋",
+    "exec": "/usr/local/bin/performance-status",
+    "return-type": "json",
+    "interval": 30,
+    "signal": 8,
+    "format": "{}",
     "tooltip": true,
-    "tooltip-format": "Профиль питания",
     "on-click": "/usr/local/bin/performance-menu"
   }
 }
@@ -3638,6 +5206,9 @@ window#waybar { background: rgba(15, 20, 16, 0.92); color: #e4ebe2; border-botto
 #battery.warning { color: #d8b76c; border-color: rgba(216, 183, 108, 0.45); }
 #battery.critical { color: #d98b7d; border-color: rgba(217, 139, 125, 0.45); }
 #custom-performance { color: #c4dfa0; padding: 0 10px; margin-right: 8px; }
+#custom-performance.power-saver { color: #a9cc82; }
+#custom-performance.performance { color: #d8b76c; }
+#custom-performance.unknown { color: #8a9a82; }
 #custom-performance:hover, #language:hover, #network:hover, #pulseaudio:hover, #backlight:hover, #battery:hover { background: rgba(169, 204, 130, 0.18); border-color: rgba(169, 204, 130, 0.55); }
 tooltip { background: rgb(20, 27, 22); border: 1px solid rgba(169, 204, 130, 0.45); border-radius: 8px; color: #e4ebe2; padding: 6px 10px; }
 tooltip label { color: #e4ebe2; }
@@ -3685,11 +5256,15 @@ EOF
 w "$H/.config/hypr/wallpaper.sh" <<'EOF'
 #!/bin/sh
 # Обои: положи картинки в ~/Pictures/wall, Super+W - следующая
+# Сплошной цвет и режим растягивания выбираются в Настройках (Super+Shift+I)
 D="$HOME/Pictures/wall"; C="$HOME/.cache/wallpaper"
-list="$(ls "$D"/*.png "$D"/*.jpg "$D"/*.jpeg "$D"/*.webp 2>/dev/null)"
+m="$(cat "$HOME/.config/hypr/wallpaper-mode" 2>/dev/null)"
+case "$m" in fill|fit|center|tile|stretch) ;; *) m=fill ;; esac
 pkill swaybg 2>/dev/null
-[ -n "$list" ] || exec swaybg -c 0f1410
 cur="$(cat "$C" 2>/dev/null)"
+case "$cur" in color:*) [ "$1" = next ] || exec swaybg -c "${cur#color:}" ;; esac
+list="$(ls "$D"/*.png "$D"/*.jpg "$D"/*.jpeg "$D"/*.webp 2>/dev/null)"
+[ -n "$list" ] || exec swaybg -c 0f1410
 if [ "$1" = next ]; then
   f="$(printf '%s\n' "$list" | awk -v c="$cur" 'f{print;exit} $0==c{f=1}')"
   [ -n "$f" ] || f="$(printf '%s\n' "$list" | head -n1)"
@@ -3697,7 +5272,7 @@ else
   f="$cur"; [ -f "$f" ] || f="$(printf '%s\n' "$list" | head -n1)"
 fi
 mkdir -p "$(dirname "$C")"; printf '%s\n' "$f" > "$C"
-exec swaybg -i "$f" -m fill
+exec swaybg -i "$f" -m "$m"
 EOF
 
 # ---------- ярлыки и программы по умолчанию ----------
@@ -3708,6 +5283,7 @@ Name=cava
 Exec=cava
 NoDisplay=true
 EOF
+# Files: в wofi не показывается (NoDisplay), но остаётся программой для папок и открывается по Super+E
 w "$H/.local/share/applications/files.desktop" <<'EOF'
 [Desktop Entry]
 Type=Application
@@ -3715,6 +5291,7 @@ Name=Files
 Exec=/usr/local/bin/files %f
 Icon=system-file-manager
 Terminal=false
+NoDisplay=true
 Categories=System;FileManager;
 MimeType=inode/directory;
 StartupWMClass=files
@@ -3757,21 +5334,23 @@ if ! grep -qsi 'hyprland' "$H/.bash_profile"; then
   [ -f "$H/.bash_profile" ] || echo '[ -f ~/.bashrc ] && . ~/.bashrc' > "$H/.bash_profile"
   cat >> "$H/.bash_profile" <<'EOF'
 if [ -z "${WAYLAND_DISPLAY:-}" ] && [ "${XDG_VTNR:-}" = 1 ]; then
-  start-hyprland || exec bash
+  if command -v start-hyprland >/dev/null 2>&1; then start-hyprland; else Hyprland; fi
 fi
 EOF
 fi
 mkdir -p "$H/Pictures/wall"
 
-# реальное имя Font Awesome (иконки в waybar, меню питания)
+# реальное имя Font Awesome (иконки в меню)
 FA="$(fc-list : family 2>/dev/null | grep -o 'Font Awesome [0-9]* Free' | head -n1 || true)"
 FA="${FA:-Font Awesome 7 Free} Solid"
-sed -i "s/FontAwesome/$FA/g" /usr/local/bin/power-menu /usr/local/bin/performance-menu \
-  /usr/local/bin/audio-menu /usr/local/bin/network-menu /usr/local/bin/year-calendar \
+sed -i "s/FontAwesome/$FA/g" /usr/local/bin/power-menu /usr/local/lib/hypr-menus/hyprmenu.py \
   "$H/.config/waybar/style.css"
+# заранее скомпилировать общий модуль меню - быстрее запуск
+python3 -m compileall -q /usr/local/lib/hypr-menus >/dev/null 2>&1 || true
 
 chown -R "$U:$G" "$H/.config" "$H/.local" "$H/Pictures" "$H/.bashrc" "$H/.bash_profile" 2>/dev/null || true
-runuser -u "$U" -- env HOME="$H" xdg-user-dirs-update 2>/dev/null || true
+# стандартные папки с английскими именами (иначе при русской локали появятся «Изображения» и т.п.)
+runuser -u "$U" -- env HOME="$H" LC_ALL=C LANG=C xdg-user-dirs-update 2>/dev/null || true
 
 # ================= сторонние приложения =================
 # fetch URL ФАЙЛ [sums] - скачать; с "sums" сверить SHA256 по SHA256SUMS.txt из того же релиза
@@ -3855,23 +5434,19 @@ install_limusic() {
 ' install_appimage "$u" limusic Limusic "AudioVideo;Audio;Player;"
   else echo "!! Limusic: не нашёл AppImage на https://github.com/SimoHypers/limusic/releases"; fi
 }
-install_opencode() {
-  local u
-  u="$(gh_asset anomalyco/opencode 'opencode-desktop-linux-(x86_64|amd64|x64)\.AppImage$' '?per_page=30')"
-  if [ -n "$u" ]; then install_appimage "$u" opencode OpenCode "Development;"
-  else echo "!! OpenCode: не нашёл AppImage на https://github.com/anomalyco/opencode/releases"; fi
-}
 install_pkg https://github.com/Happ-proxy/happ-desktop/releases/latest/download/Happ.linux.x64.pkg.tar.zst happ
 install_photocraft
 install_appimage https://download.onlyoffice.com/install/desktop/editors/linux/DesktopEditors-x86_64.AppImage onlyoffice "ONLYOFFICE" "Office;"
 install_limusic
-install_opencode
+# OpenCode больше не нужен: убрать, если уже стоит
+rm -rf /opt/opencode /usr/local/bin/opencode /usr/share/applications/opencode.desktop /usr/share/icons/hicolor/256x256/apps/opencode.png
 gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor 2>/dev/null || true
 
 # ================= wofi: в лаунчере только твои приложения =================
+# (Files и Настройки в лаунчер не попадают: Super+E и Super+Shift+I)
 allow="$( { for p in steam telegram-desktop happ firefox photocraft; do pacman -Ql "$p" 2>/dev/null; done \
   | awk '{print $2}' | grep '^/usr/share/applications/.*\.desktop$' | while read -r f; do basename "$f"; done
-  printf '%s\n' onlyoffice.desktop photocraft.desktop limusic.desktop opencode.desktop; } )"
+  printf '%s\n' onlyoffice.desktop photocraft.desktop limusic.desktop; } )"
 mkdir -p "$H/.local/share/applications"
 for f in /usr/share/applications/*.desktop; do
   [ -e "$f" ] || continue
@@ -3908,6 +5483,7 @@ echo "  Super+Enter       - терминал с fastfetch"
 echo "  Super+D           - лаунчер (повторное нажатие закрывает)"
 echo "  Super+E           - файлы"
 echo "  Super+B           - Firefox"
+echo "  Super+Shift+I     - настройки (повторное нажатие закрывает)"
 echo "  Super+W           - следующие обои"
 echo "  Super+V           - окно: плавающее / тайлинг"
 echo "  Super+F           - полный экран"
