@@ -28,7 +28,7 @@ pacman -S --noconfirm --needed \
   brightnessctl grim slurp wl-clipboard \
   ttf-dejavu ttf-font-awesome noto-fonts-emoji papirus-icon-theme adwaita-icon-theme lxqt-policykit ttf-jetbrains-mono-nerd ttf-nerd-fonts-symbols \
   python-gobject gtk3 mesa vulkan-intel power-profiles-daemon libpulse networkmanager gtk-layer-shell udisks2 xdg-utils xdg-user-dirs \
-  fastfetch chafa cava nano curl dosfstools exfatprogs ntfs-3g \
+  fastfetch chafa cava nano curl dosfstools exfatprogs ntfs-3g mat2 bubblewrap perl-image-exiftool \
   firefox firefox-i18n-ru telegram-desktop \
   jre21-openjdk
 echo "=== Steam ==="
@@ -154,6 +154,7 @@ border: 1px solid rgba(169,204,130,0.25); border-radius: 14px; box-shadow: none;
 padding: 2px 10px; min-height: 0; min-width: 0; }
 button:hover { background-color: rgba(169,204,130,0.16); }
 button:checked { background-color: rgba(169,204,130,0.30); }
+button:disabled { opacity: 0.35; }
 entry { background-image: none; background-color: rgba(169,204,130,0.06); color: #e4ebe2;
 border: 1px solid rgba(169,204,130,0.25); border-radius: 14px; box-shadow: none;
 padding: 2px 12px; min-height: 0; }
@@ -726,16 +727,26 @@ class DiskManager(Gtk.Window):
         part, free, disk = kind == "part", kind == "free", kind == "disk"
         p = k["p"] if part else None
         mounted = bool(p and p["mps"])
-        self.b_create.set_sensitive(free)
-        self.b_fmt.set_sensitive(part and not mounted)
-        self.b_del.set_sensitive(part and not mounted)
-        self.b_label.set_sensitive(bool(p and p["fstype"] and p["fstype"] not in SKIP_FS))
-        can_mount = bool(p and p["fstype"] and p["fstype"] not in SKIP_FS
-                         and (not mounted or mounted_safe_to_unmount(p["mps"])))
-        self.b_mount.set_sensitive(can_mount)
-        self.b_mount.set_label("Отключить" if mounted else "Подключить")
+        has_fs = bool(p and p["fstype"] and p["fstype"] not in SKIP_FS)
+        can_mount = bool(has_fs and (not mounted or mounted_safe_to_unmount(p["mps"])))
         d = k["disk"] if disk else None
-        self.b_table.set_sensitive(bool(d and not d["pttype"] and not d["mps"]))
+        self.enable(self.b_create, free, "Выбери строку «Свободное место»")
+        self.enable(self.b_fmt, part and not mounted,
+                    "Выбери раздел" if not part else "Раздел подключён: сначала отключи его")
+        self.enable(self.b_del, part and not mounted,
+                    "Выбери раздел" if not part else "Раздел подключён: сначала отключи его")
+        self.enable(self.b_label, has_fs, "Выбери раздел с файловой системой")
+        self.enable(self.b_mount, can_mount,
+                    "Выбери раздел с файловой системой" if not has_fs
+                    else "Системный раздел (/, /boot, /home) отсюда не отключается")
+        self.b_mount.set_label("Отключить" if mounted else "Подключить")
+        self.enable(self.b_table, bool(d and not d["pttype"] and not d["mps"]),
+                    "Выбери диск без таблицы разделов" if not disk
+                    else "На диске уже есть таблица разделов или он подключён")
+
+    def enable(self, btn, ok, why):
+        btn.set_sensitive(bool(ok))
+        btn.set_tooltip_text(None if ok else why)
 
     # ---------- операции ----------
     def run_op(self, text, fn):
@@ -2215,6 +2226,371 @@ if __name__ == "__main__":
     main()
 EOF
 chmod 755 /usr/local/bin/files
+
+# ---------- очистка метаданных (фото и файлы, на базе mat2) ----------
+cat > /usr/local/bin/meta-clean <<'EOF'
+#!/usr/bin/python3
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, Gio, GLib, Gtk, Pango
+
+CSS = b"""
+* { font-family: "DejaVu Sans Mono", monospace; font-size: 11px; }
+window { background-color: rgba(15,20,16,0.88); color: #e4ebe2; }
+window.dialog, window.messagedialog { background-color: rgb(20,27,22); }
+.bar { padding: 8px 10px 4px 10px; }
+.title { font-size: 14px; }
+button { background-image: none; background-color: rgba(169,204,130,0.06); color: #e4ebe2;
+border: 1px solid rgba(169,204,130,0.25); border-radius: 14px; box-shadow: none;
+padding: 3px 12px; min-height: 0; min-width: 0; }
+button:hover { background-color: rgba(169,204,130,0.16); }
+button.main { background-color: rgba(125,148,96,0.40); border-color: #a9cc82; }
+button.main:hover { background-color: rgba(125,148,96,0.60); }
+button:disabled { opacity: 0.45; }
+checkbutton { color: #e4ebe2; }
+treeview.view { background-color: transparent; color: #e4ebe2; }
+treeview.view:hover { background-color: rgba(169,204,130,0.08); }
+treeview.view:selected { background-color: rgba(169,204,130,0.28); color: #ffffff; }
+treeview.view.dnd { border: 1px solid rgba(169,204,130,0.80); }
+treeview header button { background-color: transparent; border: none; border-radius: 0;
+border-bottom: 1px solid rgba(169,204,130,0.18); color: #8a9a82; padding: 3px 8px; }
+scrolledwindow, viewport { background-color: transparent; }
+textview, textview text { background-color: rgba(169,204,130,0.05); color: #e4ebe2; }
+scrollbar slider { background-color: rgba(169,204,130,0.35); border-radius: 4px; min-width: 6px; min-height: 6px; }
+scrollbar { background: transparent; border: none; }
+.status { color: #8a9a82; padding: 3px 14px 8px 14px; }
+.err { color: #d98b7d; }
+.dim { color: #8a9a82; }
+.hint { color: #75846d; padding: 0 14px 6px 14px; }
+"""
+OK_C, BAD_C, WORK_C, DIM_C = "#a9cc82", "#d98b7d", "#d8b76c", "#e4ebe2"
+
+
+def mat2_cmd(*extra):
+    cmd = ["mat2"]
+    if not shutil.which("bwrap"):
+        cmd.append("--no-sandbox")
+    return cmd + list(extra)
+
+
+def first_line(text, default):
+    for ln in (text or "").splitlines():
+        ln = ln.strip()
+        if ln:
+            return re.sub(r"^\[[-+!]\]\s*", "", ln)
+    return default
+
+
+class Cleaner(Gtk.Window):
+    def __init__(self, paths):
+        super().__init__(title="Очистка метаданных")
+        self.set_default_size(780, 520)
+        self.set_decorated(False)
+        self.busy = False
+        screen = self.get_screen()
+        visual = screen.get_rgba_visual()
+        if visual:
+            self.set_visual(visual)
+        for rule in re.findall(rb"[^{}]+\{[^{}]*\}", CSS):
+            prov = Gtk.CssProvider()
+            try:
+                prov.load_from_data(rule)
+            except GLib.Error:
+                continue
+            Gtk.StyleContext.add_provider_for_screen(screen, prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.add(root)
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        bar.get_style_context().add_class("bar")
+        title = Gtk.Label(label="Очистка метаданных", xalign=0)
+        title.get_style_context().add_class("title")
+        bar.pack_start(title, True, True, 6)
+        b_close = Gtk.Button(label="Закрыть")
+        b_close.connect("clicked", lambda *_: self.destroy())
+        bar.pack_start(b_close, False, False, 0)
+        root.pack_start(bar, False, False, 0)
+        hint = Gtk.Label(label="Перетащи сюда фото и файлы (или нажми «Добавить»). Уберутся EXIF, GPS, автор, "
+                               "программа и прочие скрытые данные.", xalign=0)
+        hint.get_style_context().add_class("hint")
+        hint.set_line_wrap(True)
+        root.pack_start(hint, False, False, 0)
+        # путь, имя, папка, состояние, цвет
+        self.store = Gtk.ListStore(str, str, str, str, str)
+        self.view = Gtk.TreeView(model=self.store)
+        self.view.get_selection().set_mode(Gtk.SelectionMode.MULTIPLE)
+        self.view.set_rubber_banding(True)
+        for title, idx, expand, dim in (("Файл", 1, True, False), ("Папка", 2, True, True), ("Состояние", 3, False, False)):
+            r = Gtk.CellRendererText()
+            r.set_property("ellipsize", Pango.EllipsizeMode.MIDDLE if dim else Pango.EllipsizeMode.END)
+            if dim:
+                r.set_property("foreground", "#8a9a82")
+                col = Gtk.TreeViewColumn(title, r, text=idx)
+            elif idx == 3:
+                col = Gtk.TreeViewColumn(title, r, text=idx, foreground=4)
+                col.set_min_width(220)
+            else:
+                col = Gtk.TreeViewColumn(title, r, text=idx)
+            col.set_expand(expand)
+            col.set_resizable(True)
+            self.view.append_column(col)
+        self.view.drag_dest_set(Gtk.DestDefaults.ALL, [Gtk.TargetEntry.new("text/uri-list", 0, 0)],
+                                Gdk.DragAction.COPY)
+        self.view.connect("drag-data-received", self.on_drop)
+        scroll = Gtk.ScrolledWindow()
+        scroll.add(self.view)
+        root.pack_start(scroll, True, True, 0)
+        btns = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        btns.get_style_context().add_class("bar")
+        self.b_add = self.button(btns, "Добавить…", self.add_dialog)
+        self.b_show = self.button(btns, "Показать метаданные", self.show_meta)
+        self.b_rm = self.button(btns, "Убрать из списка", self.remove_selected)
+        self.chk = Gtk.CheckButton(label="заменять оригиналы")
+        self.chk.set_tooltip_text("Выключено: рядом создаётся копия «имя.cleaned.расширение»")
+        btns.pack_start(self.chk, False, False, 8)
+        self.b_clean = Gtk.Button(label="Очистить")
+        self.b_clean.get_style_context().add_class("main")
+        self.b_clean.connect("clicked", lambda *_: self.clean())
+        btns.pack_end(self.b_clean, False, False, 0)
+        root.pack_start(btns, False, False, 0)
+        self.status = Gtk.Label(xalign=0)
+        self.status.get_style_context().add_class("status")
+        self.status.set_ellipsize(Pango.EllipsizeMode.END)
+        root.pack_start(self.status, False, False, 0)
+        self.connect("key-press-event", self.on_key)
+        if not shutil.which("mat2"):
+            self.say("Не найден mat2. Установи: sudo pacman -S mat2", True)
+        else:
+            self.say("Список пуст")
+        self.add_paths(paths)
+
+    def button(self, box, text, cb):
+        b = Gtk.Button(label=text)
+        b.connect("clicked", lambda *_: cb())
+        box.pack_start(b, False, False, 0)
+        return b
+
+    def say(self, text, err=False):
+        ctx = self.status.get_style_context()
+        if err:
+            ctx.add_class("err")
+        else:
+            ctx.remove_class("err")
+        self.status.set_text(text)
+        return False
+
+    def on_key(self, win, ev):
+        key = Gdk.keyval_name(ev.keyval)
+        ctrl = bool(ev.state & Gdk.ModifierType.CONTROL_MASK)
+        if ctrl and key in ("q", "Q", "w", "W"):
+            self.destroy()
+        elif ctrl and key in ("o", "O"):
+            self.add_dialog()
+        elif key == "Delete":
+            self.remove_selected()
+        elif ctrl and key in ("a", "A"):
+            self.view.get_selection().select_all()
+        else:
+            return False
+        return True
+
+    # ---------- список ----------
+    def have(self):
+        return {r[0] for r in self.store}
+
+    def add_paths(self, paths):
+        have, added = self.have(), 0
+        todo = []
+        for p in paths:
+            p = os.path.abspath(p)
+            if os.path.isdir(p):
+                for r, ds, fs in os.walk(p):
+                    ds[:] = [d for d in ds if not d.startswith(".")]
+                    todo.extend(os.path.join(r, f) for f in sorted(fs) if not f.startswith("."))
+            elif os.path.isfile(p):
+                todo.append(p)
+        for p in todo:
+            if p in have:
+                continue
+            have.add(p)
+            self.store.append([p, os.path.basename(p), os.path.dirname(p), "ожидает", DIM_C])
+            added += 1
+        if added:
+            self.say(f"В списке: {len(self.store)}")
+        return added
+
+    def on_drop(self, view, ctx, x, y, data, info, t):
+        paths = []
+        for u in data.get_uris() or []:
+            p = Gio.File.new_for_uri(u).get_path()
+            if p:
+                paths.append(p)
+        self.add_paths(paths)
+
+    def add_dialog(self):
+        dlg = Gtk.FileChooserDialog(title="Выбери файлы", transient_for=self, action=Gtk.FileChooserAction.OPEN)
+        dlg.set_select_multiple(True)
+        dlg.add_button("Отмена", Gtk.ResponseType.CANCEL)
+        dlg.add_button("Добавить", Gtk.ResponseType.OK)
+        resp = dlg.run()
+        names = dlg.get_filenames()
+        dlg.destroy()
+        if resp == Gtk.ResponseType.OK:
+            self.add_paths(names)
+
+    def remove_selected(self):
+        _, rows = self.view.get_selection().get_selected_rows()
+        refs = [Gtk.TreeRowReference.new(self.store, r) for r in rows]
+        for ref in refs:
+            p = ref.get_path()
+            if p is not None:
+                self.store.remove(self.store.get_iter(p))
+        self.say(f"В списке: {len(self.store)}" if len(self.store) else "Список пуст")
+
+    def selected_or_all(self):
+        _, rows = self.view.get_selection().get_selected_rows()
+        if rows:
+            return [self.store[r][0] for r in rows]
+        return [r[0] for r in self.store]
+
+    def set_state(self, path, text, color):
+        for row in self.store:
+            if row[0] == path:
+                row[3], row[4] = text, color
+                break
+        return False
+
+    # ---------- метаданные ----------
+    def show_meta(self):
+        paths = self.selected_or_all()
+        if not paths:
+            self.say("Сначала добавь файл", True)
+            return
+        path = paths[0]
+        dlg = Gtk.Dialog(title="Метаданные", transient_for=self, modal=True)
+        dlg.add_button("Закрыть", Gtk.ResponseType.CLOSE)
+        dlg.set_default_size(620, 380)
+        head = Gtk.Label(label=os.path.basename(path), xalign=0, margin=10)
+        head.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+        view = Gtk.TextView()
+        view.set_editable(False)
+        view.set_cursor_visible(False)
+        view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        view.set_left_margin(10)
+        view.set_top_margin(8)
+        view.get_buffer().set_text("читаю…")
+        sc = Gtk.ScrolledWindow()
+        sc.add(view)
+        box = dlg.get_content_area()
+        box.pack_start(head, False, False, 0)
+        box.pack_start(sc, True, True, 0)
+
+        def work():
+            try:
+                r = subprocess.run(mat2_cmd("--show", path), capture_output=True, text=True, timeout=60)
+                text = (r.stdout + ("\n" + r.stderr if r.stderr.strip() else "")).strip() or "Метаданных нет"
+            except Exception as e:
+                text = "Ошибка: " + str(e)
+            GLib.idle_add(view.get_buffer().set_text, text)
+        threading.Thread(target=work, daemon=True).start()
+        dlg.show_all()
+        dlg.run()
+        dlg.destroy()
+
+    # ---------- чистка ----------
+    def clean(self):
+        if self.busy:
+            return
+        if not shutil.which("mat2"):
+            self.say("Не найден mat2. Установи: sudo pacman -S mat2", True)
+            return
+        paths = self.selected_or_all()
+        if not paths:
+            self.say("Сначала добавь файлы", True)
+            return
+        inplace = self.chk.get_active()
+        if inplace:
+            dlg = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.WARNING,
+                                    buttons=Gtk.ButtonsType.YES_NO,
+                                    text=f"Заменить оригиналы очищенными версиями ({len(paths)})?\n"
+                                         "Вернуть исходные метаданные будет нельзя.")
+            resp = dlg.run()
+            dlg.destroy()
+            if resp != Gtk.ResponseType.YES:
+                return
+        self.busy = True
+        self.b_clean.set_sensitive(False)
+        self.say("Чищу…")
+
+        def work():
+            ok = bad = 0
+            for p in paths:
+                GLib.idle_add(self.set_state, p, "чищу…", WORK_C)
+                good, text = self.run_one(p, inplace)
+                if good:
+                    ok += 1
+                    GLib.idle_add(self.set_state, p, text, OK_C)
+                else:
+                    bad += 1
+                    GLib.idle_add(self.set_state, p, "ошибка: " + text, BAD_C)
+            GLib.idle_add(self.finish, ok, bad)
+        threading.Thread(target=work, daemon=True).start()
+
+    def run_one(self, path, inplace):
+        cmd = mat2_cmd("--inplace", path) if inplace else mat2_cmd(path)
+        base, ext = os.path.splitext(path)
+        target = f"{base}.cleaned{ext}"
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+        except Exception as e:
+            return False, str(e)
+        if r.returncode != 0 or (not inplace and not os.path.exists(target)):
+            return False, first_line(r.stderr + "\n" + r.stdout, "формат не поддерживается")
+        if inplace:
+            return True, "готово (оригинал заменён)"
+        return True, "готово → " + os.path.basename(target)
+
+    def finish(self, ok, bad):
+        self.busy = False
+        self.b_clean.set_sensitive(True)
+        if bad:
+            self.say(f"Очищено: {ok}, не удалось: {bad}", True)
+        else:
+            self.say(f"Очищено файлов: {ok}")
+        return False
+
+
+def main():
+    GLib.set_prgname("meta-clean")
+    GLib.set_application_name("meta-clean")
+    paths = [os.path.expanduser(a) for a in sys.argv[1:]]
+    win = Cleaner(paths)
+    win.connect("destroy", Gtk.main_quit)
+    win.show_all()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()
+EOF
+chmod 755 /usr/local/bin/meta-clean
+cat > /usr/share/applications/meta-clean.desktop <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Очистка метаданных
+Comment=Удалить метаданные из фото и файлов
+Exec=/usr/local/bin/meta-clean %F
+Icon=edit-clear-all
+Terminal=false
+Categories=Utility;
+StartupWMClass=meta-clean
+EOF
 
 # ---------- меню питания ----------
 cat > /usr/local/bin/power-menu <<'EOF'
@@ -4585,6 +4961,7 @@ hl.window_rule({ name = "float-performance-menu", match = { class = "^(performan
 hl.window_rule({ name = "float-audio-menu", match = { class = "^(audio-menu)$" }, float = true })
 hl.window_rule({ name = "float-network-menu", match = { class = "^(network-menu)$" }, float = true })
 hl.window_rule({ name = "float-year-calendar", match = { class = "^(year-calendar)$" }, float = true })
+hl.window_rule({ name = "float-meta-clean", match = { class = "^(meta-clean)$" }, float = true })
 EOF
 
 # ---------- alacritty ----------
@@ -4794,16 +5171,36 @@ gtk-application-prefer-dark-theme=1
 gtk-icon-theme-name=Papirus-Dark
 EOF
 
-# Картинка для fastfetch: положи PNG в ~/.config/fastfetch/logo.png (лучше 512x512)
+# Картинка для fastfetch: положи фото в ~/.config/fastfetch/ под именем logo.png (или logo.jpg / logo.jpeg / logo.webp)
 w "$H/.config/fastfetch/show.sh" <<'EOF'
 #!/bin/sh
-LOGO="$HOME/.config/fastfetch/logo.png"
-if [ -f "$LOGO" ]; then
+D="$HOME/.config/fastfetch"
+LOGO=""
+for e in png jpg jpeg webp PNG JPG JPEG WEBP; do
+  [ -f "$D/logo.$e" ] && { LOGO="$D/logo.$e"; break; }
+done
+if [ -n "$LOGO" ]; then
   fastfetch --logo "$LOGO" --logo-type chafa --logo-width 30 --logo-height 15
 else
   fastfetch --logo none
 fi
 exec bash
+EOF
+
+# обычная команда fastfetch в терминале тоже берёт твоё фото (иначе показывает логотип Arch)
+grep -qF 'fastfetch-logo' "$H/.bashrc" 2>/dev/null || cat >> "$H/.bashrc" <<'EOF'
+# fastfetch-logo
+fastfetch() {
+  local d="$HOME/.config/fastfetch" e f=""
+  for e in png jpg jpeg webp PNG JPG JPEG WEBP; do
+    [ -f "$d/logo.$e" ] && { f="$d/logo.$e"; break; }
+  done
+  if [ -n "$f" ]; then
+    command fastfetch --logo "$f" --logo-type chafa --logo-width 30 --logo-height 15 "$@"
+  else
+    command fastfetch "$@"
+  fi
+}
 EOF
 
 w "$H/.config/hypr/wallpaper.sh" <<'EOF'
@@ -4839,6 +5236,7 @@ Name=Files
 Exec=/usr/local/bin/files %f
 Icon=system-file-manager
 Terminal=false
+NoDisplay=true
 Categories=System;FileManager;
 MimeType=inode/directory;
 StartupWMClass=files
@@ -4990,7 +5388,7 @@ gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor 2>/dev/null || true
 # ================= wofi: в лаунчере только твои приложения =================
 allow="$( { for p in steam telegram-desktop happ firefox photocraft; do pacman -Ql "$p" 2>/dev/null; done \
   | awk '{print $2}' | grep '^/usr/share/applications/.*\.desktop$' | while read -r f; do basename "$f"; done
-  printf '%s\n' onlyoffice.desktop photocraft.desktop limusic.desktop; } )"
+  printf '%s\n' onlyoffice.desktop photocraft.desktop limusic.desktop meta-clean.desktop; } )"
 mkdir -p "$H/.local/share/applications"
 for f in /usr/share/applications/*.desktop; do
   [ -e "$f" ] || continue
