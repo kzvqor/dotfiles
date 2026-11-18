@@ -4968,10 +4968,10 @@ EOF
 w "$H/.config/alacritty/alacritty.toml" <<'EOF'
 [window]
 decorations = "none"
-opacity = 1.0
+opacity = 0.65
 
 [colors.primary]
-background = "#121712"
+background = "#0a0e0a"
 foreground = "#dfe8d8"
 
 [font]
