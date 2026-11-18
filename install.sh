@@ -4963,7 +4963,7 @@ def menu_path(svc, path):
 
 def layout(svc, menu):
     run("call", svc, menu, DM, "AboutToShow", "i", "0")
-    ok, d = run("call", svc, menu, DM, "GetLayout", "iias", "0", "-1", "0")
+    ok, d = run("call", svc, menu, DM, "GetLayout", "iias", "0", "10", "0")
     if not ok or not d:
         return None
     node = find_node(d.get("data") if isinstance(d, dict) else d)
@@ -5140,16 +5140,26 @@ def debug():
     ok, _ = run("get-property", WATCHER, "/StatusNotifierWatcher", WATCHER, "IsStatusNotifierHostRegistered")
     print("StatusNotifierWatcher (waybar tray):", "есть" if ok else "НЕТ")
     items = tray_items()
-    print("значки в трее:", items or "нет (запущен ли waybar с модулем tray и Happ?)")
+    print("значки в трее:", items or "нет")
+    for svc, path in items:
+        print("--- значок", svc, path)
+        print("  похож на Happ:", is_happ(svc, path))
+        for prop in ("Id", "Title", "Menu", "ItemIsMenu"):
+            ok, d = run("get-property", svc, path, SNI, prop)
+            print("  %s: %s" % (prop, json.dumps(d, ensure_ascii=False) if ok else "ошибка/нет свойства"))
+        menu = menu_path(svc, path)
+        if menu:
+            ok, d = run("call", svc, menu, DM, "GetLayout", "iias", "0", "10", "0")
+            raw = json.dumps(d, ensure_ascii=False) if ok else "ошибка вызова GetLayout"
+            print("  GetLayout:", raw[:1500])
+            ent = layout(svc, menu)
+            print("  разобрано пунктов:", None if ent is None else [(e["id"], e["label"]) for e in ent])
     m = get_menu()
-    if not m:
+    if m:
+        st, entry = classify(m[2])
+        print("Happ найден. состояние:", st, "| кликаю по:", entry and entry["label"])
+    else:
         print("Happ в трее не найден")
-        return
-    print("Happ: %s %s" % (m[0], m[1]))
-    for e in m[2]:
-        print("  id=%s label=%r enabled=%s visible=%s submenu=%s" % (e["id"], e["label"], e["enabled"], e["visible"], e["sub"]))
-    st, entry = classify(m[2])
-    print("состояние:", st, "| кликаю по:", entry and entry["label"])
 
 
 if __name__ == "__main__":
