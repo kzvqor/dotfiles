@@ -5489,7 +5489,7 @@ window#waybar { background: rgba(15, 20, 16, 0.92); color: #e4ebe2; border-botto
 #custom-happ-status.show { background-color: rgba(169, 204, 130, 0.06); border-color: rgba(169, 204, 130, 0.25); }
 #custom-happ-status.show.on { color: #a9cc82; }
 #custom-happ-status.show.off { color: #d98b7d; }
-#tray, #tray * { min-width: 0; min-height: 0; padding: 0; margin: 0; border: none; background: transparent; }
+#tray, #tray * { opacity: 0; min-width: 0; min-height: 0; padding: 0; margin: 0; border: none; background: transparent; }
 #pulseaudio.muted { color: #8a9a82; }
 #battery.warning { color: #d8b76c; border-color: rgba(216, 183, 108, 0.45); }
 #battery.critical { color: #d98b7d; border-color: rgba(217, 139, 125, 0.45); }
