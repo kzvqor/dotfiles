@@ -4849,6 +4849,314 @@ print(json.dumps(out, ensure_ascii=False))
 EOF
 chmod 755 /usr/local/bin/performance-status
 
+# happ-vpn: вкл/выкл Happ из waybar (нажимает пункт в меню значка Happ в трее, окно не открывается)
+cat > /usr/local/bin/happ-vpn <<'EOF_HAPP'
+#!/usr/bin/env python3
+# happ-vpn - включить/выключить VPN в Happ из waybar, ничего не открывая.
+# Нажимает пункт "Подключить/Отключить" в меню значка Happ в трее (DBus).
+#   happ-vpn toggle      - переключить
+#   happ-vpn icon        - путь к иконке для waybar (вкл/выкл)
+#   happ-vpn label-line  - JSON для плавной надписи вкл/выкл
+#   happ-vpn debug       - показать, что скрипт видит в меню Happ
+import fcntl
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+RUN = os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid()
+K = float(os.environ.get("HAPP_VPN_TIME_SCALE", "1"))
+CFG = os.path.expanduser("~/.config/waybar")
+CACHE = RUN + "/happ-vpn.item"
+LABEL_FILE = RUN + "/happ-vpn.label"
+WATCHER = "org.kde.StatusNotifierWatcher"
+SNI = "org.kde.StatusNotifierItem"
+DM = "com.canonical.dbusmenu"
+ME = os.environ.get("HAPP_VPN_SELF", "/usr/local/bin/happ-vpn")
+
+# пункт "отключить" есть в меню -> сейчас подключено; пункт "подключить" -> отключено
+DISC = re.compile(r"disconnect|отключ|выключ|turn\s*off|stop|остановит", re.I)
+CONN = re.compile(r"connect|подключ|включ|turn\s*on|start|запуст", re.I)
+SKIP = re.compile(r"startup|autostart|автозап|автозагр|auto|авто|settings|настрой|quit|exit|выход|window|окно", re.I)
+
+
+def nap(sec):
+    time.sleep(sec * K)
+
+
+def run(*args, timeout=4):
+    try:
+        r = subprocess.run(["busctl", "--user", "--json=short", *args],
+                           capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return False, None
+    data = None
+    if r.stdout.strip():
+        try:
+            data = json.loads(r.stdout)
+        except ValueError:
+            pass
+    return r.returncode == 0, data
+
+
+def unwrap(v):
+    while isinstance(v, dict) and set(v.keys()) == {"type", "data"}:
+        v = v["data"]
+    return v
+
+
+def find_node(x):
+    x = unwrap(x)
+    if isinstance(x, list):
+        if (len(x) == 3 and isinstance(unwrap(x[0]), int)
+                and isinstance(unwrap(x[1]), dict) and isinstance(unwrap(x[2]), list)):
+            return x
+        for e in x:
+            r = find_node(e)
+            if r:
+                return r
+    return None
+
+
+def tray_items():
+    ok, d = run("get-property", WATCHER, "/StatusNotifierWatcher", WATCHER, "RegisteredStatusNotifierItems")
+    out = []
+    if not ok or not d:
+        return out
+    for s in unwrap(d) or []:
+        if "/" in s:
+            svc, path = s.split("/", 1)
+            out.append((svc, "/" + path))
+        else:
+            out.append((s, "/StatusNotifierItem"))
+    return out
+
+
+def is_happ(svc, path):
+    text = svc + path
+    for prop in ("Id", "Title"):
+        ok, d = run("get-property", svc, path, SNI, prop)
+        if ok and d:
+            text += " " + str(unwrap(d))
+    if re.search("happ", text, re.I):
+        return True
+    ok, d = run("call", "org.freedesktop.DBus", "/org/freedesktop/DBus",
+                "org.freedesktop.DBus", "GetConnectionUnixProcessID", "s", svc)
+    if ok and d:
+        pid = unwrap(d)
+        pid = pid[0] if isinstance(pid, list) else pid
+        try:
+            with open("/proc/%s/cmdline" % pid, "rb") as f:
+                return b"happ" in f.read().lower()
+        except OSError:
+            pass
+    return False
+
+
+def menu_path(svc, path):
+    ok, d = run("get-property", svc, path, SNI, "Menu")
+    return unwrap(d) if ok and d else None
+
+
+def layout(svc, menu):
+    run("call", svc, menu, DM, "AboutToShow", "i", "0")
+    ok, d = run("call", svc, menu, DM, "GetLayout", "iias", "0", "-1", "0")
+    if not ok or not d:
+        return None
+    node = find_node(d.get("data") if isinstance(d, dict) else d)
+    if not node:
+        return None
+    out = []
+    for ch in unwrap(node[2]):
+        n = find_node(ch)
+        if not n:
+            continue
+        props = {k: unwrap(v) for k, v in unwrap(n[1]).items()}
+        out.append({
+            "id": unwrap(n[0]),
+            "label": re.sub(r"[_&]", "", str(props.get("label", ""))),
+            "enabled": props.get("enabled", True) is not False,
+            "visible": props.get("visible", True) is not False,
+            "sep": props.get("type") == "separator",
+            "sub": bool(unwrap(n[2])),
+        })
+    return out
+
+
+def get_menu():
+    """(svc, menu, entries) для Happ в трее или None, если Happ не запущен."""
+    try:
+        with open(CACHE) as f:
+            svc, menu = json.load(f)
+        ent = layout(svc, menu)
+        if ent is not None:
+            return svc, menu, ent
+    except (OSError, ValueError):
+        pass
+    for svc, path in tray_items():
+        if not is_happ(svc, path):
+            continue
+        menu = menu_path(svc, path)
+        ent = layout(svc, menu) if menu else None
+        if ent is not None:
+            try:
+                with open(CACHE, "w") as f:
+                    json.dump([svc, menu], f)
+            except OSError:
+                pass
+            return svc, menu, ent
+    return None
+
+
+def classify(entries):
+    cand = [e for e in entries
+            if e["visible"] and e["enabled"] and not e["sep"] and not e["sub"] and not SKIP.search(e["label"])]
+    for e in cand:
+        if DISC.search(e["label"]):
+            return "on", e
+    for e in cand:
+        if CONN.search(e["label"]):
+            return "off", e
+    return None, None
+
+
+def current():
+    """(состояние 'on'/'off', пункт меню для клика, данные меню)."""
+    m = get_menu()
+    if not m:
+        return "off", None, None
+    st, entry = classify(m[2])
+    return (st or "off"), entry, m
+
+
+def signal(n):
+    subprocess.run(["pkill", "-RTMIN+%d" % n, "-x", "waybar"], stderr=subprocess.DEVNULL)
+
+
+def launch():
+    exe = shutil.which("happ")
+    if not exe:
+        try:
+            with open("/usr/share/applications/happ.desktop") as f:
+                for line in f:
+                    if line.startswith("Exec="):
+                        exe = re.sub(r"\s%[a-zA-Z]", "", line[5:]).strip()
+                        break
+        except OSError:
+            pass
+    if exe:
+        subprocess.Popen(exe, shell=True, start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    return False
+
+
+def toggle():
+    lk = open(RUN + "/happ-vpn-toggle.lock", "w")
+    try:
+        fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return  # предыдущее переключение ещё идёт - клик игнорируем
+    st, entry, m = current()
+    if m is None:
+        if not launch():
+            print("happ-vpn: Happ не найден", file=sys.stderr)
+            return
+        for _ in range(40):
+            nap(0.5)
+            if get_menu():
+                break
+        nap(2)
+        st, entry, m = current()
+    if entry is None:
+        print("happ-vpn: в меню Happ нет пункта подключения. Запусти: happ-vpn debug", file=sys.stderr)
+        return
+    want = "off" if st == "on" else "on"
+    run("call", m[0], m[1], DM, "Event", "isvu", str(entry["id"]), "clicked", "s", "", str(int(time.time()) & 0xFFFFFFFF))
+    reached = False
+    for _ in range(12):
+        nap(1)
+        signal(9)
+        if current()[0] == want:
+            reached = True
+            break
+    signal(9)
+    if reached:
+        subprocess.Popen([ME, "label", want], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def put_label(text, cls):
+    with open(LABEL_FILE, "w") as f:
+        json.dump({"text": text, "class": cls}, f, ensure_ascii=False)
+    signal(8)
+
+
+def label(state):
+    # надписи идут строго по очереди: следующая ждёт, пока предыдущая исчезнет + пауза
+    lk = open(RUN + "/happ-vpn-label.lock", "w")
+    fcntl.flock(lk, fcntl.LOCK_EX)
+    txt = "вкл" if state == "on" else "выкл"
+    put_label(txt, ["pre", state])    # невидимый
+    nap(0.15)
+    put_label(txt, ["show", state])   # плавно появляется
+    nap(2.6)
+    put_label(txt, ["hide", state])   # плавно исчезает
+    nap(0.8)
+    put_label("", "")                 # модуль скрыт, места не занимает
+    nap(2.0)                          # пауза между надписями
+
+
+def label_line():
+    try:
+        with open(LABEL_FILE) as f:
+            print(f.read())
+    except OSError:
+        print('{"text": ""}')
+
+
+def icon():
+    st = current()[0]
+    path = "%s/happ-%s.png" % (CFG, "on" if st == "on" else "off")
+    if os.path.exists(path):
+        print(path)
+        print("Happ VPN: %s (клик - %s)" % (("включён", "выключить") if st == "on" else ("выключен", "включить")))
+
+
+def debug():
+    items = tray_items()
+    print("значки в трее:", items or "нет (запущен ли waybar с модулем tray и Happ?)")
+    m = get_menu()
+    if not m:
+        print("Happ в трее не найден")
+        return
+    print("Happ: %s %s" % (m[0], m[1]))
+    for e in m[2]:
+        print("  id=%s label=%r enabled=%s visible=%s submenu=%s" % (e["id"], e["label"], e["enabled"], e["visible"], e["sub"]))
+    st, entry = classify(m[2])
+    print("состояние:", st, "| кликаю по:", entry and entry["label"])
+
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "toggle"
+    if cmd == "toggle":
+        toggle()
+    elif cmd == "label":
+        label(sys.argv[2])
+    elif cmd == "label-line":
+        label_line()
+    elif cmd == "icon":
+        icon()
+    elif cmd == "debug":
+        debug()
+    else:
+        print(__doc__)
+EOF_HAPP
+chmod 755 /usr/local/bin/happ-vpn
+
 # ================= конфиги пользователя =================
 # w ФАЙЛ - записать stdin в файл (старую версию один раз сохраняет в .bak)
 w() {
@@ -5002,7 +5310,7 @@ w "$H/.config/waybar/config.jsonc" <<'EOF'
   "spacing": 4,
   "modules-left": ["custom/launcher", "hyprland/workspaces"],
   "modules-center": ["clock#time", "clock#date"],
-  "modules-right": ["hyprland/language", "network", "pulseaudio", "backlight", "battery", "custom/performance"],
+  "modules-right": ["tray", "custom/happ-status", "image#happ", "hyprland/language", "network", "pulseaudio", "backlight", "battery", "custom/performance"],
   "custom/launcher": {
     "format": "◈",
     "tooltip": true,
@@ -5070,6 +5378,24 @@ w "$H/.config/waybar/config.jsonc" <<'EOF'
     "format": "󰌌  {short}",
     "tooltip": true
   },
+  "tray": {
+    "icon-size": 1,
+    "spacing": 0
+  },
+  "custom/happ-status": {
+    "exec": "/usr/local/bin/happ-vpn label-line",
+    "return-type": "json",
+    "interval": "once",
+    "signal": 8,
+    "tooltip": false
+  },
+  "image#happ": {
+    "exec": "/usr/local/bin/happ-vpn icon",
+    "interval": 4,
+    "size": 14,
+    "signal": 9,
+    "on-click": "/usr/local/bin/happ-vpn toggle"
+  },
   "network": {
     "format-wifi": "{icon}",
     "format-ethernet": "󰈀",
@@ -5135,6 +5461,13 @@ window#waybar { background: rgba(15, 20, 16, 0.92); color: #e4ebe2; border-botto
 #clock.date:hover { background: rgba(169, 204, 130, 0.18); color: #e4ebe2; }
 #language, #network, #pulseaudio, #backlight, #battery, #custom-performance { background: rgba(169, 204, 130, 0.06); color: #e4ebe2; border: 1px solid rgba(169, 204, 130, 0.25); border-radius: 6px; padding: 0 9px; margin: 4px 2px; }
 #language { color: #dfe8d8; }
+#image.happ { background-color: rgba(169, 204, 130, 0.06); border: 1px solid rgba(169, 204, 130, 0.25); border-radius: 6px; padding: 0 8px; margin: 4px 2px; }
+#image.happ:hover { background-color: rgba(169, 204, 130, 0.18); border-color: rgba(169, 204, 130, 0.55); }
+#custom-happ-status { color: rgba(228, 235, 226, 0); background-color: rgba(169, 204, 130, 0); border: 1px solid rgba(169, 204, 130, 0); border-radius: 6px; padding: 0 9px; margin: 4px 2px; transition: color 0.6s ease, background-color 0.6s ease, border-color 0.6s ease; }
+#custom-happ-status.show { background-color: rgba(169, 204, 130, 0.06); border-color: rgba(169, 204, 130, 0.25); }
+#custom-happ-status.show.on { color: #a9cc82; }
+#custom-happ-status.show.off { color: #d98b7d; }
+#tray, #tray * { min-width: 0; min-height: 0; padding: 0; margin: 0; border: none; background: transparent; }
 #pulseaudio.muted { color: #8a9a82; }
 #battery.warning { color: #d8b76c; border-color: rgba(216, 183, 108, 0.45); }
 #battery.critical { color: #d98b7d; border-color: rgba(217, 139, 125, 0.45); }
@@ -5378,6 +5711,36 @@ install_limusic() {
   else echo "!! Limusic: не нашёл AppImage на https://github.com/SimoHypers/limusic/releases"; fi
 }
 install_pkg https://github.com/Happ-proxy/happ-desktop/releases/latest/download/Happ.linux.x64.pkg.tar.zst happ
+# иконка Happ для waybar: цветная (вкл) и серая (выкл) - берутся из самого пакета Happ
+happ_icons="$(pacman -Ql happ 2>/dev/null | awk '{print $2}' | grep -iE '(icons|pixmaps)/.*\.(png|svg)$|happ[^/]*\.(png|svg)$' || true)"
+mkdir -p "$H/.config/waybar"
+python3 - "$H/.config/waybar" $happ_icons <<'GENEOF' || echo "!! не смог сделать иконку Happ для waybar"
+import sys
+import gi
+gi.require_version("GdkPixbuf", "2.0")
+from gi.repository import GdkPixbuf, GLib
+out, best, area = sys.argv[1], None, 0
+for p in sys.argv[2:]:
+    info = GdkPixbuf.Pixbuf.get_file_info(p)
+    if info and info[0] and info[1] * info[2] >= area:
+        best, area = p, info[1] * info[2]
+if not best:
+    sys.exit("в пакете Happ не нашлось иконки")
+pb = GdkPixbuf.Pixbuf.new_from_file_at_size(best, 64, 64)
+if not pb.get_has_alpha():
+    pb = pb.add_alpha(False, 0, 0, 0)
+pb.savev(out + "/happ-on.png", "png", [], [])
+gray = pb.copy()
+pb.saturate_and_pixelate(gray, 0.0, False)
+w, h, rs = gray.get_width(), gray.get_height(), gray.get_rowstride()
+data = bytearray(gray.get_pixels())
+for y in range(h):
+    for x in range(w):
+        i = y * rs + x * 4 + 3
+        data[i] = data[i] * 45 // 100
+GdkPixbuf.Pixbuf.new_from_bytes(GLib.Bytes.new(bytes(data)), GdkPixbuf.Colorspace.RGB, True, 8, w, h, rs).savev(out + "/happ-off.png", "png", [], [])
+GENEOF
+chown "$U:$G" "$H/.config/waybar/happ-on.png" "$H/.config/waybar/happ-off.png" 2>/dev/null || true
 install_photocraft
 install_appimage https://download.onlyoffice.com/install/desktop/editors/linux/DesktopEditors-x86_64.AppImage onlyoffice "ONLYOFFICE" "Office;"
 install_limusic
@@ -5417,6 +5780,7 @@ echo
 echo "Готово. ПЕРЕЗАГРУЗИСЬ (reboot). После входа на TTY1 Hyprland запустится сам."
 echo "NVIDIA: драйверы удалены, nouveau/nvidia заблокированы, карта отключена при загрузке - работает только Intel."
 echo "Профили питания: кнопка справа в waybar (энергосбережение / баланс / производительность)."
+echo "Happ VPN: иконка слева от раскладки в waybar - клик включает/выключает VPN (сервер выбери один раз в самом Happ)."
 echo "Обои: положи картинки в ~/Pictures/wall (светлые аниме-обои дадут вид как на фото)."
 echo "Визуализатор: открой терминал и набери  cava"
 echo
