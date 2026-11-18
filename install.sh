@@ -5036,6 +5036,11 @@ def signal(n):
     subprocess.run(["pkill", "-RTMIN+%d" % n, "-x", "waybar"], stderr=subprocess.DEVNULL)
 
 
+def happ_running():
+    r = subprocess.run(["pgrep", "-a", "-i", "-x", "happ"], capture_output=True, text=True)
+    return r.stdout.strip()
+
+
 def launch():
     exe = shutil.which("happ")
     if not exe:
@@ -5062,6 +5067,10 @@ def toggle():
         return  # предыдущее переключение ещё идёт - клик игнорируем
     st, entry, m = current()
     if m is None:
+        if happ_running():
+            # Happ уже запущен, но его меню в трее не видно - второй раз не запускаем
+            print("happ-vpn: Happ запущен, но его значка/меню в трее нет. Запусти: happ-vpn debug", file=sys.stderr)
+            return
         if not launch():
             print("happ-vpn: Happ не найден", file=sys.stderr)
             return
@@ -5127,6 +5136,9 @@ def icon():
 
 
 def debug():
+    print("процесс Happ:", happ_running() or "не запущен")
+    ok, _ = run("get-property", WATCHER, "/StatusNotifierWatcher", WATCHER, "IsStatusNotifierHostRegistered")
+    print("StatusNotifierWatcher (waybar tray):", "есть" if ok else "НЕТ")
     items = tray_items()
     print("значки в трее:", items or "нет (запущен ли waybar с модулем tray и Happ?)")
     m = get_menu()
