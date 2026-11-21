@@ -5833,9 +5833,17 @@ rm -rf /opt/opencode /usr/local/bin/opencode /usr/share/applications/opencode.de
 gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor 2>/dev/null || true
 
 # ================= wofi: в лаунчере только твои приложения =================
-allow="$( { for p in steam telegram-desktop happ firefox photocraft $AUR_OK; do pacman -Ql "$p" 2>/dev/null; done \
+# свой список для wofi: впиши в ~/.config/wofi-allow.txt имя пакета (zed) или файла (dev.zed.Zed.desktop), по одному в строке
+if [ ! -f "$H/.config/wofi-allow.txt" ]; then
+  printf '%s\n' '# Приложения, которые показывать в wofi (по одному в строке): имя пакета или имя .desktop-файла' \
+    '# После правки запусти install.sh ещё раз' 'zed' > "$H/.config/wofi-allow.txt"
+  chown "$U:$G" "$H/.config/wofi-allow.txt" 2>/dev/null || true
+fi
+extra_pkgs="$(grep -vE '^[[:space:]]*(#|$)' "$H/.config/wofi-allow.txt" | grep -v '\.desktop$' || true)"
+extra_desk="$(grep -E '\.desktop$' "$H/.config/wofi-allow.txt" || true)"
+allow="$( { for p in steam telegram-desktop happ firefox photocraft zed zed-editor zed-preview $AUR_OK $extra_pkgs; do pacman -Ql "$p" 2>/dev/null; done \
   | awk '{print $2}' | grep '^/usr/share/applications/.*\.desktop$' | while read -r f; do basename "$f"; done
-  printf '%s\n' meta-clean.desktop; } )"
+  printf '%s\n' meta-clean.desktop $extra_desk; } )"
 mkdir -p "$H/.local/share/applications"
 for f in /usr/share/applications/*.desktop; do
   [ -e "$f" ] || continue
