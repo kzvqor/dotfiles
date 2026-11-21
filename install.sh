@@ -963,6 +963,7 @@ class FilesWindow(Gtk.Window):
         self.items = []
         self.ftext = ""
         self.drag_paths = []
+        self.press_sel = []
         self.drag_xy = (0, 0)
         self.scroll_id = 0
         self.disk_win = None
@@ -1356,7 +1357,18 @@ class FilesWindow(Gtk.Window):
 
     # ---------- перетаскивание ----------
     def on_drag_begin(self, view, ctx):
-        self.drag_paths = self.selected_paths()
+        cur = self.selected_paths()
+        keep = list(self.press_sel)
+        self.press_sel = []
+        if len(keep) > len(cur) and set(cur) <= set(keep):
+            # GTK успел сбросить выделение до одной строки - возвращаем всё, что было выделено
+            sel = view.get_selection()
+            sel.unselect_all()
+            for row in self.store:
+                if row[5] in keep:
+                    sel.select_iter(row.iter)
+            cur = self.selected_paths()
+        self.drag_paths = cur
         self.set_drag_icon(ctx)
 
     def set_drag_icon(self, ctx):
@@ -1701,9 +1713,19 @@ class FilesWindow(Gtk.Window):
             self.open_path(row[5])
 
     def open_path(self, path):
-        if path.lower().endswith((".pkg.tar.zst", ".pkg.tar.xz")) and shutil.which("pkg-install"):
+        low = path.lower()
+        if re.search(r"\.pkg\.tar(\.\w+)?$", low) and shutil.which("pkg-install"):
             subprocess.Popen(["pkg-install", path], start_new_session=True)
             self.say("Устанавливаю: " + os.path.basename(path))
+            return
+        if low.endswith(".appimage"):
+            try:
+                os.chmod(path, os.stat(path).st_mode | 0o111)
+                env = dict(os.environ, APPIMAGE_EXTRACT_AND_RUN="1")
+                subprocess.Popen([path], env=env, cwd=os.path.dirname(path), start_new_session=True)
+                self.say("Запускаю: " + os.path.basename(path))
+            except Exception as e:
+                self.say(f"Не удалось запустить AppImage: {e}", True)
             return
         ok = False
         try:
@@ -1716,8 +1738,10 @@ class FilesWindow(Gtk.Window):
         try:
             if Gio.content_type_is_a(ctype, "text/plain") and shutil.which("nano"):
                 subprocess.Popen(["alacritty", "-e", "nano", path], start_new_session=True)
-            else:
+            elif ctype.split("/")[0] in ("text", "image", "video", "audio") or ctype == "application/pdf":
                 subprocess.Popen(["firefox", path], start_new_session=True)
+            else:
+                self.say(f"Нечем открыть ({ctype})", True)
         except Exception as e:
             self.say(f"Нечем открыть ({ctype}): {e}", True)
 
@@ -2071,7 +2095,13 @@ class FilesWindow(Gtk.Window):
     def on_view_click(self, view, ev):
         if ev.button == 1 and ev.type == Gdk.EventType.BUTTON_PRESS:
             # рамка выделения - только с пустого места, иначе строку можно тащить
-            view.set_rubber_banding(view.get_path_at_pos(int(ev.x), int(ev.y)) is None)
+            hit = view.get_path_at_pos(int(ev.x), int(ev.y))
+            view.set_rubber_banding(hit is None)
+            # запоминаем выделение до нажатия: если тащат одну из выделенных строк, переносится всё выделенное
+            self.press_sel = []
+            if hit is not None and not (ev.state & (Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK)):
+                if view.get_selection().path_is_selected(hit[0]):
+                    self.press_sel = self.selected_paths()
             return False
         if ev.button != 3:
             return False
@@ -5655,6 +5685,45 @@ chown -R "$U:$G" "$H/.config" "$H/.local" "$H/Pictures" "$H/.bashrc" "$H/.bash_p
 runuser -u "$U" -- env HOME="$H" xdg-user-dirs-update 2>/dev/null || true
 
 # ================= сторонние приложения =================
+
+# ---------- yay (AUR) ----------
+# yay и makepkg нельзя запускать от root: всё идёт от обычного пользователя $U
+as_user() { ( cd /tmp && runuser -u "$U" -- env HOME="$H" "$@" ); }
+echo "=== yay ==="
+pacman -S --needed --noconfirm git base-devel || echo "!! не поставились git/base-devel"
+# на время работы скрипта пользователю нужен sudo без пароля (yay зовёт sudo pacman); файл удаляется при выходе
+printf '%s ALL=(ALL) NOPASSWD: ALL\n' "$U" > /etc/sudoers.d/99-yay-tmp
+chmod 440 /etc/sudoers.d/99-yay-tmp
+visudo -cf /etc/sudoers.d/99-yay-tmp >/dev/null || rm -f /etc/sudoers.d/99-yay-tmp
+trap 'rm -f /etc/sudoers.d/99-yay-tmp' EXIT
+if ! command -v yay >/dev/null 2>&1; then
+  as_user bash -c 'set -e; d="$(mktemp -d)"; git clone --depth 1 https://aur.archlinux.org/yay-bin.git "$d/yay-bin"; cd "$d/yay-bin"; makepkg -si --noconfirm; cd /tmp; rm -rf "$d"' \
+    || echo "!! yay не установился (нужен доступ к aur.archlinux.org / включи VPN и запусти скрипт ещё раз)"
+fi
+# aur_install НАЗВАНИЕ ПАКЕТ [ПАКЕТ...] - ставит первый из списка, который реально есть в AUR/репозиториях
+AUR_OK=""
+aur_install() {
+  local title="$1" p; shift
+  command -v yay >/dev/null 2>&1 || { echo "!! $title: yay не установлен"; return 1; }
+  for p in "$@"; do
+    if as_user yay -Si "$p" >/dev/null 2>&1; then
+      if as_user yay -S --needed --noconfirm "$p"; then
+        AUR_OK="$AUR_OK $p"; echo "ok: $title ($p)"; return 0
+      fi
+      echo "!! $title: $p не собрался"; return 1
+    fi
+  done
+  echo "!! $title: не нашёл в AUR ни один из пакетов: $*. Найди точное имя на https://aur.archlinux.org и впиши в скрипт."
+  return 1
+}
+# убрать старые AppImage-установки (то, что раньше ставил install_appimage), чтобы не было двух копий
+for b in onlyoffice limusic photocraft; do
+  if [ -d "/opt/$b/squashfs-root" ] || [ -f "/opt/$b/app.AppImage" ]; then rm -rf "/opt/$b"; fi
+  if [ -f "/usr/local/bin/$b" ] && grep -qE 'AppRun|app\.AppImage' "/usr/local/bin/$b" 2>/dev/null; then rm -f "/usr/local/bin/$b"; fi
+  if [ -f "/usr/share/applications/$b.desktop" ] && ! pacman -Qo "/usr/share/applications/$b.desktop" >/dev/null 2>&1; then rm -f "/usr/share/applications/$b.desktop"; fi
+  if [ -f "/usr/share/icons/hicolor/256x256/apps/$b.png" ] && ! pacman -Qo "/usr/share/icons/hicolor/256x256/apps/$b.png" >/dev/null 2>&1; then rm -f "/usr/share/icons/hicolor/256x256/apps/$b.png"; fi
+done
+
 # fetch URL ФАЙЛ [sums] - скачать; с "sums" сверить SHA256 по SHA256SUMS.txt из того же релиза
 fetch() {
   curl -fL --retry 3 -o "$2" "$1" || { rm -f "$2"; return 1; }
@@ -5680,61 +5749,24 @@ install_pkg() {
   pacman -U --noconfirm "$f" || echo "!! $2 не установился (скрипт продолжает работу)"
   rm -f "$f"
 }
-# install_appimage ССЫЛКА КОМАНДА НАЗВАНИЕ КАТЕГОРИИ [sums]
-install_appimage() {
-  local url="$1" bin="$2" title="$3" cats="$4" P="/opt/$2" run icon src
-  if [ ! -x "$P/squashfs-root/AppRun" ]; then
-    mkdir -p "$P"; rm -rf "$P/squashfs-root"
-    if fetch "$url" "$P/app.AppImage" "${5:-}"; then
-      chmod 755 "$P/app.AppImage"
-      ( cd "$P" && ./app.AppImage --appimage-extract >/dev/null 2>&1 && rm -f app.AppImage ) || true
-    fi
-  fi
-  chmod -R a+rX "$P" 2>/dev/null || true
-  [ ! -f "$P/squashfs-root/chrome-sandbox" ] || { chown root:root "$P/squashfs-root/chrome-sandbox"; chmod 4755 "$P/squashfs-root/chrome-sandbox"; }
-  if [ -x "$P/squashfs-root/AppRun" ]; then run="$P/squashfs-root/AppRun"
-  elif [ -x "$P/app.AppImage" ]; then run="$P/app.AppImage --appimage-extract-and-run"
-  else echo "!! $title не поставился: нет доступа к сайту/GitHub. Включи VPN (Happ) и запусти install.sh ещё раз."; return 0; fi
-  printf '#!/bin/sh\n%sexec %s "$@"\n' "${APPENV:-}" "$run" > "/usr/local/bin/$bin"
-  chmod 755 "/usr/local/bin/$bin"
-  # иконка: сначала .DirIcon (официальная иконка AppImage), потом из usr/share/icons, потом любая png в корне
-  src=""
-  if [ -f "$P/squashfs-root/.DirIcon" ] && [ "$(head -c 4 "$P/squashfs-root/.DirIcon" 2>/dev/null | tail -c 3)" = PNG ]; then
-    src="$P/squashfs-root/.DirIcon"
-  fi
-  [ -n "$src" ] || src="$(find "$P/squashfs-root/usr/share/icons" -name '*.png' 2>/dev/null | sort -V | tail -n1 || true)"
-  [ -n "$src" ] || src="$(find "$P/squashfs-root" -maxdepth 1 -name '*.png' 2>/dev/null | head -n1 || true)"
-  icon=application-x-executable
-  if [ -n "$src" ] && [ -f "$src" ]; then
-    install -Dm644 "$src" "/usr/share/icons/hicolor/256x256/apps/$bin.png"
-    icon="$bin"
-  fi
-  cat > "/usr/share/applications/$bin.desktop" <<DESK_EOF
-[Desktop Entry]
-Type=Application
-Name=$title
-Exec=$bin
-Icon=$icon
-Terminal=false
-Categories=$cats
-DESK_EOF
-  echo "ok: $title"
-}
 install_photocraft() {
   local u
   u="$(gh_asset storytold/photocraft 'x86_64.*\.pkg\.tar\.zst$')"
   if [ -n "$u" ]; then install_pkg "$u" photocraft sums; return 0; fi
-  u="$(gh_asset storytold/photocraft 'x86_64.*\.AppImage$')"
-  if [ -n "$u" ]; then install_appimage "$u" photocraft PhotoCraft "Graphics;" sums; return 0; fi
-  echo "!! PhotoCraft: не нашёл сборку. Скачай её (Linux x86_64) со страницы"
-  echo "!! https://github.com/storytold/photocraft/releases"
+  aur_install PhotoCraft photocraft-bin photocraft && return 0
+  echo "!! PhotoCraft: не нашёл сборку. Скачай .pkg.tar.zst (Linux x86_64) со страницы"
+  echo "!! https://github.com/storytold/photocraft/releases и открой его в Files (Super+E)"
+  return 0
 }
 install_limusic() {
-  local u
-  u="$(gh_asset SimoHypers/limusic '(x86_64|amd64).*\.AppImage$')"
-  if [ -n "$u" ]; then APPENV='export WEBKIT_DISABLE_DMABUF_RENDERER=1
-' install_appimage "$u" limusic Limusic "AudioVideo;Audio;Player;"
-  else echo "!! Limusic: не нашёл AppImage на https://github.com/SimoHypers/limusic/releases"; fi
+  local real
+  aur_install Limusic limusic-bin limusic || return 0
+  # раньше AppImage запускался с этой переменной (иначе WebKit может давать чёрное окно) - сохраняем это
+  real="$(command -v limusic || true)"
+  if [ -n "$real" ] && [ "$real" != /usr/local/bin/limusic ]; then
+    printf '#!/bin/sh\nexport WEBKIT_DISABLE_DMABUF_RENDERER=1\nexec %s "$@"\n' "$real" > /usr/local/bin/limusic
+    chmod 755 /usr/local/bin/limusic
+  fi
 }
 install_pkg https://github.com/Happ-proxy/happ-desktop/releases/latest/download/Happ.linux.x64.pkg.tar.zst happ
 # иконка Happ для waybar: цветная (вкл) и серая (выкл) - берутся из самого пакета Happ
@@ -5768,16 +5800,42 @@ GdkPixbuf.Pixbuf.new_from_bytes(GLib.Bytes.new(bytes(data)), GdkPixbuf.Colorspac
 GENEOF
 chown "$U:$G" "$H/.config/waybar/happ-on.png" "$H/.config/waybar/happ-off.png" 2>/dev/null || true
 install_photocraft
-install_appimage https://download.onlyoffice.com/install/desktop/editors/linux/DesktopEditors-x86_64.AppImage onlyoffice "ONLYOFFICE" "Office;"
+aur_install ONLYOFFICE onlyoffice-bin || true
 install_limusic
+# VLC и qView: ставим, но в wofi они не показываются (в allow-списке ниже их нет)
+echo "=== VLC и qView ==="
+pacman -S --noconfirm --needed vlc || echo "!! VLC не установился (скрипт продолжает работу)"
+if pacman -Si vlc-plugins-all >/dev/null 2>&1; then pacman -S --noconfirm --needed vlc-plugins-all || true; fi
+pacman -S --noconfirm --needed qt5-imageformats qt5-svg >/dev/null 2>&1 || true
+aur_install qView qview || true
+AUR_OK="${AUR_OK// qview/}"
+
+# приложения по умолчанию: фото -> qView, видео и аудио -> VLC (только если реально установились)
+set_mime() { # ФАЙЛ.desktop тип...
+  local app="$1" t; shift
+  [ -f "$H/.config/mimeapps.list" ] || return 0
+  for t in "$@"; do
+    sed -i "\|^$t=|d" "$H/.config/mimeapps.list"
+    sed -i "/^\[Default Applications\]/a $t=$app" "$H/.config/mimeapps.list"
+  done
+}
+qv="$(pacman -Ql qview 2>/dev/null | awk '{print $2}' | grep '/usr/share/applications/.*\.desktop$' | head -n1 | xargs -r basename || true)"
+if [ -n "$qv" ]; then
+  set_mime "$qv" image/png image/jpeg image/gif image/webp image/bmp image/tiff image/avif image/x-icon image/heif
+fi
+if [ -f /usr/share/applications/vlc.desktop ]; then
+  set_mime vlc.desktop video/mp4 video/webm video/x-matroska video/quicktime video/x-msvideo video/mpeg video/ogg video/x-flv video/3gpp video/x-ms-wmv \
+    audio/mpeg audio/ogg audio/flac audio/x-flac audio/x-wav audio/mp4 audio/aac audio/opus audio/x-opus+ogg audio/x-vorbis+ogg audio/x-ms-wma
+fi
+chown "$U:$G" "$H/.config/mimeapps.list" 2>/dev/null || true
 # OpenCode больше не нужен: убрать, если уже стоит
 rm -rf /opt/opencode /usr/local/bin/opencode /usr/share/applications/opencode.desktop /usr/share/icons/hicolor/256x256/apps/opencode.png
 gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor 2>/dev/null || true
 
 # ================= wofi: в лаунчере только твои приложения =================
-allow="$( { for p in steam telegram-desktop happ firefox photocraft; do pacman -Ql "$p" 2>/dev/null; done \
+allow="$( { for p in steam telegram-desktop happ firefox photocraft $AUR_OK; do pacman -Ql "$p" 2>/dev/null; done \
   | awk '{print $2}' | grep '^/usr/share/applications/.*\.desktop$' | while read -r f; do basename "$f"; done
-  printf '%s\n' onlyoffice.desktop photocraft.desktop limusic.desktop meta-clean.desktop; } )"
+  printf '%s\n' meta-clean.desktop; } )"
 mkdir -p "$H/.local/share/applications"
 for f in /usr/share/applications/*.desktop; do
   [ -e "$f" ] || continue
